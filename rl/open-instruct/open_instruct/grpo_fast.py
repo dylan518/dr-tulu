@@ -1948,12 +1948,14 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
     tool_objects = {}
     tool_max_conc = args.tool_max_concurrency
 
-    # one additional thing: set mcp host if we are in a beaker job
-    if os.environ.get("BEAKER_LEADER_REPLICA_IP") is not None or os.environ.get("MCP_TRANSPORT_HOST") is not None:
-        args.mcp_host = os.environ.get("BEAKER_LEADER_REPLICA_IP") or os.environ.get("MCP_TRANSPORT_HOST")
+    # one additional thing: set mcp host if we are in a beaker job or MCP_TRANSPORT_HOST is set
+    beaker_ip = os.environ.get("BEAKER_LEADER_REPLICA_IP")
+    mcp_host_env = os.environ.get("MCP_TRANSPORT_HOST")
+    if beaker_ip or mcp_host_env:
+        args.mcp_host = beaker_ip or mcp_host_env
         print(f"🚨 Setting MCP host to {args.mcp_host} based on BEAKER_LEADER_REPLICA_IP or MCP_TRANSPORT_HOST")
-        # minor fix.
-        if "127.0.0.1" in args.mcp_host:
+        # minor fix: replace loopback with wildcard for external access
+        if args.mcp_host and "127.0.0.1" in args.mcp_host:
             args.mcp_host = "0.0.0.0"
 
     def _register_actor_backed_tool(class_path: str, init_kwargs: dict):

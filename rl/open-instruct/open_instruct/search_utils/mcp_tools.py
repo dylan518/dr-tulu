@@ -10,6 +10,11 @@ import httpx
 import httpcore
 
 try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
     from dr_agent.tool_interface.mcp_tools import MassiveServeSearchTool, SemanticScholarSnippetSearchTool, SerperSearchTool, Crawl4AIBrowseTool, SerperBrowseTool, JinaBrowseTool
 except ImportError as e:
     print(f"Failed to import dr_agent. Please install it:\n{e}")
@@ -60,6 +65,32 @@ class MCPTool(Tool):
     to work out how to route them. Ideally, this would be more tightly integrated into vllm,
     but for now, this is a bit cleaner.
     """
+    # Simple counters for tool usage tracking
+    _stats = {"calls": {}, "errors": {}, "timeouts": {}, "total": 0}
+    
+    @classmethod
+    def _log_stats(cls):
+        if cls._stats["total"] > 0 and cls._stats["total"] % 100 == 0:
+            lines = [f"\n📊 MCP Tool Stats (total: {cls._stats['total']} calls)"]
+            wandb_metrics = {"tool_stats/total_calls": cls._stats["total"]}
+            for tool, calls in sorted(cls._stats["calls"].items(), key=lambda x: -x[1]):
+                errs = cls._stats["errors"].get(tool, 0)
+                timeouts = cls._stats["timeouts"].get(tool, 0)
+                err_rate = 100 * errs / calls if calls > 0 else 0
+                timeout_rate = 100 * timeouts / calls if calls > 0 else 0
+                lines.append(f"  {tool}: {calls} calls, err_rate={err_rate:.1f}%, timeout_rate={timeout_rate:.1f}%")
+                # Add to wandb metrics
+                wandb_metrics[f"tool_stats/{tool}_calls"] = calls
+                wandb_metrics[f"tool_stats/{tool}_err_rate"] = err_rate
+                wandb_metrics[f"tool_stats/{tool}_timeout_rate"] = timeout_rate
+            print("\n".join(lines))
+            # Log to wandb if available and initialized
+            if wandb and wandb.run:
+                try:
+                    wandb.log(wandb_metrics)
+                except Exception:
+                    pass  # Silently ignore wandb errors
+    
     def __init__(
         self,
         mcp_tool_names: List[str] | str,
@@ -168,6 +199,12 @@ class MCPTool(Tool):
         except Exception as e:
             error = str(e)
         if document_tool_output is None:
+            # Track failed calls
+            fail_name = tool_used_name or "unknown"
+            MCPTool._stats["total"] += 1
+            MCPTool._stats["calls"][fail_name] = MCPTool._stats["calls"].get(fail_name, 0) + 1
+            MCPTool._stats["errors"][fail_name] = MCPTool._stats["errors"].get(fail_name, 0) + 1
+            MCPTool._log_stats()
             if error is None and not found_tool:
                 error = "No valid tool calls found."
                 print(f"MCP Tool Error: {error}")
@@ -206,6 +243,14 @@ class MCPTool(Tool):
         if document_tool_output.error:
             print(f"MCP {tool_used_name} Tool Error: {document_tool_output.error}")
             print("Returning error output anyway.")
+        # Track stats
+        MCPTool._stats["total"] += 1
+        MCPTool._stats["calls"][tool_used_name] = MCPTool._stats["calls"].get(tool_used_name, 0) + 1
+        if document_tool_output.error:
+            MCPTool._stats["errors"][tool_used_name] = MCPTool._stats["errors"].get(tool_used_name, 0) + 1
+        if document_tool_output.timeout:
+            MCPTool._stats["timeouts"][tool_used_name] = MCPTool._stats["timeouts"].get(tool_used_name, 0) + 1
+        MCPTool._log_stats()
         # munge into format that open-instruct likes.
         return ToolOutput(
             output=text_output,
