@@ -470,6 +470,8 @@ class Args:
     """Whether to use the static rubrics as persistent rubrics"""
     add_static_rubrics_to_active_rubrics_every_n_steps: int = 10
     """How often to add the static rubrics to the active rubrics"""
+    only_adaptive_rubrics_for_training: bool = False
+    """If True, only use adaptive rubrics for training (static rubrics are ignored during training but still used for evaluation)"""
     no_citation_reward: bool = False
     """Whether to not apply citation reward"""
     use_likert_rubric: bool = False
@@ -1315,8 +1317,10 @@ def data_preparation_thread(
                 print()
 
         # Add static rubrics to active rubrics every N steps when use_static_rubrics_as_persistent_rubrics is False
+        # Skip this entirely if only_adaptive_rubrics_for_training is True
         if (rubric_buffer is not None and 
             not args.use_static_rubrics_as_persistent_rubrics and 
+            not args.only_adaptive_rubrics_for_training and
             training_step % args.add_static_rubrics_to_active_rubrics_every_n_steps == 0):
             
             added_count = 0
@@ -1893,6 +1897,8 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
     rubric_buffer = None
     if args.apply_adaptive_rubric_reward and args.use_rubric_buffer:
         print("🚨 Applying adaptive rubric reward")
+        if args.only_adaptive_rubrics_for_training:
+            print("🚨 Only using adaptive rubrics for training (static rubrics disabled for training, but kept for evaluation)")
         print("Example of ground truth:")
         print(train_dataset[0][GROUND_TRUTHS_KEY])
         # Initialize rubric buffer with active and inactive rubrics for each query
@@ -1902,11 +1908,26 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
                 gt = json.loads(ex[GROUND_TRUTHS_KEY][0])
             else:
                 gt = json.loads(ex[GROUND_TRUTHS_KEY])
+            
+            # Determine active and persistent rubrics based on settings
+            if args.only_adaptive_rubrics_for_training:
+                # Only adaptive rubrics for training: no static rubrics in active or persistent
+                active_rubrics = []
+                persistent_rubrics = []
+            elif args.use_static_rubrics_as_persistent_rubrics:
+                # Static rubrics as persistent (always used)
+                active_rubrics = []
+                persistent_rubrics = gt['rubrics']
+            else:
+                # Static rubrics start as active (can be rotated out)
+                active_rubrics = gt['rubrics']
+                persistent_rubrics = []
+            
             rubric_buffer[gt['query']] = {
-                'active_rubrics': [] if args.use_static_rubrics_as_persistent_rubrics else gt['rubrics'], 
+                'active_rubrics': active_rubrics, 
                 'inactive_rubrics': [],
-                'persistent_rubrics': gt['rubrics'] if args.use_static_rubrics_as_persistent_rubrics else [],  # Forced to use every time
-                'static_rubrics': gt['rubrics'],  # Keep a copy of original GT rubrics
+                'persistent_rubrics': persistent_rubrics,
+                'static_rubrics': gt['rubrics'],  # Keep a copy of original GT rubrics for evaluation
             }
     
 
