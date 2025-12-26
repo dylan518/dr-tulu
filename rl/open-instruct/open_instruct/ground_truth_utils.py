@@ -45,6 +45,7 @@ from open_instruct.search_rewards.utils.finegrained_utils import FinegrainedScor
 from open_instruct.search_rewards.toy_case_multi_dataset_reward import compute_multi_question_reward
 from open_instruct.search_rewards.utils.search_utils import score_query_redundancy
 from open_instruct.search_rewards.utils.run_utils import run_litellm
+from open_instruct.search_rewards.re_search_llm_judge import compute_re_search_llm_judge_reward
 from open_instruct.utils import extract_final_answer
 from open_instruct.IFEvalG import instructions_registry
 
@@ -785,6 +786,44 @@ class R1SearchVerifier(VerifierFunction):
 
         # 5. No match found
         return VerificationResult(score=0.0)
+
+
+class ReSearchLLMJudgeVerifier(VerifierFunction):
+    """
+    LLM-based verifier for ReSearch-style datasets.
+    
+    Similar to R1SearchVerifier, but instead of exact matching after normalization,
+    uses an LLM to judge whether the predicted answer is equivalent to the ground truth.
+    This handles cases where answers are semantically equivalent but not textually identical.
+    
+    Main implementation is in open_instruct.search_rewards.re_search_llm_judge
+    """
+
+    def __init__(
+        self, 
+        verifier_config: Optional[VerifierConfig] = None,
+        grader_model: str = "gpt-4.1-mini",
+    ) -> None:
+        super().__init__(name="re_search_llm_judge", verifier_config=verifier_config, weight=1.0)
+        self.grader_model = grader_model
+
+    def __call__(
+        self,
+        tokenized_prediction: List[int],
+        prediction: str,
+        label: Union[str, List[str]],
+        query: Optional[str] = None,
+    ) -> VerificationResult:
+        result = compute_re_search_llm_judge_reward(
+            prediction=prediction,
+            label=label,
+            query=query,
+            grader_model=self.grader_model,
+        )
+        return VerificationResult(
+            score=result["score"],
+            reasoning=result.get("reasoning"),
+        )
 
 
 class MaxLenVerifier(VerifierFunction):

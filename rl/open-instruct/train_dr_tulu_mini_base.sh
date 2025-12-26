@@ -5,7 +5,7 @@ exp_name="dr-tulu-mini-base"
 # dataset_list="rl-research/dr-tulu-rl-data 1.0 rl-rag/RaR-Medicine-20k-o3-mini-converted 3000 rl-rag/RaR-Science-20k-o3-mini-converted 1000"
 
 # if using the docker container, you can use this path. Otherwise, you need to set the path to the blocklist file.
-export CRAWL4AI_BLOCKLIST_PATH=/stage/rl-rag-mcp/utils/crawl4ai_block_list.txt
+# export CRAWL4AI_BLOCKLIST_PATH=/gpfs/projects/kohlab/rulins/dr-tulu/rl/open-instruct/crawl4ai_block_list.txt
 export MCP_MAX_CONCURRENT_CALLS=512
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export RUBRIC_JUDGE_MODEL=gpt-4.1-mini

@@ -27,6 +27,7 @@ export MCP_TRANSPORT_PORT=8003
 # in ai2, we use the following script:
 # source configs/beaker_configs/ray_node_setup.sh
 
+export OUTPUT_DIR=/gpfs/scrubbed/rulins/dr-tulu/
 
 uv run --extra compile python open_instruct/grpo_fast.py \
         --exp_name ${exp_name} \
@@ -38,17 +39,18 @@ uv run --extra compile python open_instruct/grpo_fast.py \
         --num_epochs 1 \
         --learning_rate 5e-7 \
         --per_device_train_batch_size 1 \
-        --output_dir output \
+        --output_dir $OUTPUT_DIR/output \
         --kl_estimator kl3 \
         --dataset_mixer_list ${dataset_list} \
         --dataset_mixer_list_splits train \
         --dataset_mixer_eval_list rl-research/filtered_webshaper_rl_data_251224 16 \
         --dataset_mixer_eval_list_splits train \
+        --overwrite_reward_fn_tag re_search_f1 \
         --apply_adaptive_rubric_reward false \
-        --max_token_length 10240 \
+        --max_token_length 24576 \
         --max_prompt_token_length 2048 \
-        --response_length 16384 \
-        --pack_length 18500 \
+        --response_length 30720 \
+        --pack_length 32768 \
         --model_name_or_path ${model_name} \
         --non_stop_penalty False \
         --non_stop_penalty_value 0.0 \
@@ -64,15 +66,16 @@ uv run --extra compile python open_instruct/grpo_fast.py \
         --apply_verifiable_reward true \
         --seed 1 \
         --num_evals 500 \
-        --save_freq 50 \
+        --save_freq 5 \
         --try_launch_beaker_eval_jobs_on_weka False \
         --gradient_checkpointing \
         --with_tracking \
-        --max_tool_calls 10 \
+        --max_tool_calls 20 \
         --only_reward_good_outputs False \
         --tools mcp \
-        --checkpoint_state_freq 50 \
-        --checkpoint_state_dir output/checkpoints \
+        --checkpoint_state_freq 5 \
+        --checkpoint_state_dir $OUTPUT_DIR/output/checkpoints/${exp_name} \
+        --keep_last_n_checkpoints 3 \
         --mcp_parser_name v20250824 \
         --system_prompt_file open_instruct/search_utils/system_prompts/unified_tool_calling_v20250907.yaml  \
         --mcp_tool_names 'snippet_search,google_search,browse_webpage' \

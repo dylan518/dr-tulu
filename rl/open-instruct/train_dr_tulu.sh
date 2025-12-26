@@ -1,4 +1,4 @@
-model_name=rl-research/DR-Tulu-SFT-8B
+model_name=rl-research/DR-Tulu-8B
 dataset_list="rl-research/dr-tulu-rl-data 1.0"
 exp_name="dr-tulu-rl-1node"
 # if you want to add the rar data, convert it to our format and then add to the dataset list, e.g.:
@@ -16,7 +16,7 @@ exp_name="dr-tulu-rl-1node"
 # if using the docker container and crawl4ai, you can use this path.
 # Otherwise, you need to set the path to the blocklist file.
 # not used for jina.
-export CRAWL4AI_BLOCKLIST_PATH=/stage/rl-rag-mcp/utils/crawl4ai_block_list.txt
+# export CRAWL4AI_BLOCKLIST_PATH=/gpfs/projects/kohlab/rulins/dr-tulu/rl/open-instruct/crawl4ai_block_list.txt
 export MCP_MAX_CONCURRENT_CALLS=512
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export RUBRIC_JUDGE_MODEL=gpt-4.1-mini

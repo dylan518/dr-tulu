@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dr-tulu-ttt
+#SBATCH --job-name=ttt-dr-tulu
 #SBATCH --account=rulins
 #SBATCH --qos=normal
 #SBATCH --gres=gpu:8
