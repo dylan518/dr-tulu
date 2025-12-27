@@ -136,7 +136,8 @@ echo "=============================================="
 echo "Running evaluation metrics..."
 echo "=============================================="
 
-python scripts/evaluate.py $DATASET "$EVAL_OUTPUT_DIR/${DATASET}.jsonl"
+# Use dedicated healthbench evaluator (handles deduplication, uses official scoring)
+python scripts/evaluate_healthbench.py "$EVAL_OUTPUT_DIR/${DATASET}.jsonl"
 
 echo "=============================================="
 echo "Evaluation complete!"
