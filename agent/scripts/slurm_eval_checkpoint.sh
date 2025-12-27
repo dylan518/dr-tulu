@@ -2,7 +2,7 @@
 #SBATCH --job-name=eval-dr-tulu
 #SBATCH --account=rulins
 #SBATCH --qos=normal
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
 #SBATCH --time=24:00:00
