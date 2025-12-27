@@ -45,7 +45,7 @@ uv run --extra compile python open_instruct/grpo_fast.py \
         --dataset_mixer_list_splits train \
         --dataset_mixer_eval_list rl-research/filtered_webshaper_rl_data_251224 16 \
         --dataset_mixer_eval_list_splits train \
-        --overwrite_reward_fn_tag re_search_f1 \
+        --overwrite_reward_fn_tag re_search_llm_judge \
         --apply_adaptive_rubric_reward false \
         --max_token_length 24576 \
         --max_prompt_token_length 2048 \
