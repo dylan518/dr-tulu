@@ -18,8 +18,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+AGENT_ROOT = PROJECT_ROOT.parent  # agent/ directory for dr_agent imports
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(AGENT_ROOT))
 
 # Samplers
 from samplers._types import Eval, EvalResult, MessageList, SamplerBase, SingleEvalResult

@@ -14,8 +14,10 @@ Examples:
 import sys
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).parent.parent))
-sys.path.append(str(Path(__file__).parent.parent / "evaluation"))
+# Insert at beginning to override installed packages
+AGENT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(AGENT_ROOT))
+sys.path.insert(0, str(AGENT_ROOT / "evaluation"))
 
 import argparse
 import json

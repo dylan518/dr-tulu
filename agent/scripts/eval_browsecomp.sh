@@ -1,18 +1,19 @@
 #!/bin/bash
-# Evaluate a local HuggingFace checkpoint on HealthBench
-# Usage: bash scripts/eval_local_checkpoint.sh [STEP]
-# Example: bash scripts/eval_local_checkpoint.sh 115
+# Evaluate a local HuggingFace checkpoint on BrowseComp
+# Usage: bash scripts/eval_browsecomp.sh [STEP] [NUM_EXAMPLES]
+# Example: bash scripts/eval_browsecomp.sh 115 100
 
 set -e
 
 # ============================================
 # Configuration
 # ============================================
-STEP="${1:-115}"
-DATASET="healthbench"
-CHECKPOINT_BASE="/gpfs/scrubbed/rulins/dr-tulu/output/dr-tulu-ttt-1node__1__1766744848_checkpoints"
+STEP="${1:-240}"
+NUM_EXAMPLES="${2:-100}"
+DATASET="browsecomp"
+CHECKPOINT_BASE="/gpfs/scrubbed/rulins/dr-tulu/output/dr-tulu-rl-shortform__1__1767075970_checkpoints"
 HF_CHECKPOINT_DIR="${CHECKPOINT_BASE}/step_${STEP}"
-EVAL_OUTPUT_DIR="/gpfs/scrubbed/rulins/dr-tulu/eval_output/dr-tulu-ttt-${DATASET}-step${STEP}"
+EVAL_OUTPUT_DIR="/gpfs/scrubbed/rulins/dr-tulu/eval_output/dr-tulu-ttt-${DATASET}-step${STEP}-n${NUM_EXAMPLES}"
 
 # Server ports
 MODEL_PORT=30001
@@ -31,10 +32,11 @@ if [ ! -d "$HF_CHECKPOINT_DIR" ]; then
 fi
 
 echo "=============================================="
-echo "Evaluating checkpoint on $DATASET"
+echo "Evaluating checkpoint on $DATASET (n=$NUM_EXAMPLES)"
 echo "=============================================="
 echo "Checkpoint: $HF_CHECKPOINT_DIR"
 echo "Step:       $STEP"
+echo "Samples:    $NUM_EXAMPLES"
 echo "Output dir: $EVAL_OUTPUT_DIR"
 echo "=============================================="
 
@@ -50,6 +52,9 @@ eval "$(conda shell.bash hook)"
 conda activate /gpfs/projects/kohlab/rulins/env/dr_agent
 
 cd /gpfs/projects/kohlab/rulins/dr-tulu/agent
+
+# Source environment variables (API keys)
+export $(grep -v '^#' .env | xargs)
 
 # ============================================
 # Kill existing servers
@@ -111,29 +116,29 @@ for i in {1..120}; do
 done
 
 # ============================================
-# Run evaluation
+# Run evaluation (generation)
 # ============================================
 echo "=============================================="
-echo "Running $DATASET evaluation..."
+echo "Running $DATASET generation (n=$NUM_EXAMPLES)..."
 echo "=============================================="
 
 mkdir -p "$EVAL_OUTPUT_DIR"
 
 python workflows/auto_search_sft.py \
     generate-dataset $DATASET \
-    --num-examples final_run \
+    --num-examples $NUM_EXAMPLES \
     --max-concurrent $MAX_CONCURRENT \
     --batch-size $MAX_CONCURRENT \
     --use-cache \
     --config workflows/auto_search_sft.yaml \
-    --config-overrides "search_agent_model_name=$HF_CHECKPOINT_DIR,use_browse_agent=true,search_agent_max_tool_calls=10,browse_tool_name=jina" \
+    --config-overrides "search_agent_model_name=$HF_CHECKPOINT_DIR,use_browse_agent=true,search_agent_max_tool_calls=20,browse_tool_name=jina" \
     --output "$EVAL_OUTPUT_DIR/${DATASET}.jsonl"
 
 # ============================================
 # Run scoring
 # ============================================
 echo "=============================================="
-echo "Running evaluation metrics..."
+echo "Running BrowseComp evaluation..."
 echo "=============================================="
 
 # Run evaluation

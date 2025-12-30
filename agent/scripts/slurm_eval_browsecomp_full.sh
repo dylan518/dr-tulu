@@ -1,18 +1,26 @@
 #!/bin/bash
-# Evaluate a local HuggingFace checkpoint on HealthBench
-# Usage: bash scripts/eval_local_checkpoint.sh [STEP]
-# Example: bash scripts/eval_local_checkpoint.sh 115
+#SBATCH --job-name=eval-browsecomp
+#SBATCH --account=rulins
+#SBATCH --qos=normal
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=200G
+#SBATCH --time=24:00:00
+#SBATCH --output=/gpfs/scrubbed/rulins/slurm_logs/dr-tulu/eval/browsecomp-full-%j.out
+
+# BrowseComp evaluation script for full 1000 samples
+# Supports both HuggingFace models and local checkpoints
+# Expects environment variables: MODEL_NAME, MODEL_TAG, NUM_EXAMPLES
 
 set -e
 
-# ============================================
-# Configuration
-# ============================================
-STEP="${1:-115}"
-DATASET="healthbench"
-CHECKPOINT_BASE="/gpfs/scrubbed/rulins/dr-tulu/output/dr-tulu-ttt-1node__1__1766744848_checkpoints"
-HF_CHECKPOINT_DIR="${CHECKPOINT_BASE}/step_${STEP}"
-EVAL_OUTPUT_DIR="/gpfs/scrubbed/rulins/dr-tulu/eval_output/dr-tulu-ttt-${DATASET}-step${STEP}"
+# Defaults
+MODEL_NAME="${MODEL_NAME:-rl-research/DR-Tulu-8B}"
+MODEL_TAG="${MODEL_TAG:-base}"
+NUM_EXAMPLES="${NUM_EXAMPLES:-1000}"
+
+DATASET="browsecomp"
+EVAL_OUTPUT_DIR="/gpfs/scrubbed/rulins/dr-tulu/eval_output/dr-tulu-shortform-${DATASET}-${MODEL_TAG}-n${NUM_EXAMPLES}"
 
 # Server ports
 MODEL_PORT=30001
@@ -20,36 +28,28 @@ BROWSE_MODEL_PORT=30002
 MCP_PORT=8000
 MAX_CONCURRENT=20
 
-# ============================================
-# Validate checkpoint
-# ============================================
-if [ ! -d "$HF_CHECKPOINT_DIR" ]; then
-    echo "Error: Checkpoint directory not found: $HF_CHECKPOINT_DIR"
-    echo "Available checkpoints:"
-    ls -1 "$CHECKPOINT_BASE" | grep step_ | sort -t_ -k2 -n
-    exit 1
-fi
-
 echo "=============================================="
-echo "Evaluating checkpoint on $DATASET"
+echo "Evaluating on $DATASET (n=$NUM_EXAMPLES)"
 echo "=============================================="
-echo "Checkpoint: $HF_CHECKPOINT_DIR"
-echo "Step:       $STEP"
+echo "Model:      $MODEL_NAME"
+echo "Tag:        $MODEL_TAG"
+echo "Samples:    $NUM_EXAMPLES"
 echo "Output dir: $EVAL_OUTPUT_DIR"
 echo "=============================================="
 
 # ============================================
 # Activate environment
 # ============================================
-# Deactivate any existing conda env first to avoid conflicts
 conda deactivate 2>/dev/null || true
 conda deactivate 2>/dev/null || true
 
-# Activate the dr_agent environment
 eval "$(conda shell.bash hook)"
 conda activate /gpfs/projects/kohlab/rulins/env/dr_agent
 
 cd /gpfs/projects/kohlab/rulins/dr-tulu/agent
+
+# Source environment variables (API keys)
+export $(grep -v '^#' .env | xargs)
 
 # ============================================
 # Kill existing servers
@@ -67,7 +67,7 @@ sleep 2
 # Launch VLLM server (main model on GPU 0)
 # ============================================
 echo "Starting main VLLM server on port $MODEL_PORT (GPU 0)..."
-screen -dmS vllm_main bash -c "eval \"\$(conda shell.bash hook)\" && conda activate /gpfs/projects/kohlab/rulins/env/dr_agent && CUDA_VISIBLE_DEVICES=0 vllm serve $HF_CHECKPOINT_DIR --dtype auto --port $MODEL_PORT --max-model-len 40960 2>&1 | tee /tmp/vllm_main.log"
+screen -dmS vllm_main bash -c "eval \"\$(conda shell.bash hook)\" && conda activate /gpfs/projects/kohlab/rulins/env/dr_agent && CUDA_VISIBLE_DEVICES=0 vllm serve $MODEL_NAME --dtype auto --port $MODEL_PORT --max-model-len 40960 2>&1 | tee /tmp/vllm_main.log"
 
 # ============================================
 # Launch VLLM browse agent server (Qwen3-8B on GPU 1)
@@ -111,41 +111,40 @@ for i in {1..120}; do
 done
 
 # ============================================
-# Run evaluation
+# Run evaluation (generation)
 # ============================================
 echo "=============================================="
-echo "Running $DATASET evaluation..."
+echo "Running $DATASET generation (n=$NUM_EXAMPLES)..."
 echo "=============================================="
 
 mkdir -p "$EVAL_OUTPUT_DIR"
 
 python workflows/auto_search_sft.py \
     generate-dataset $DATASET \
-    --num-examples final_run \
+    --num-examples $NUM_EXAMPLES \
     --max-concurrent $MAX_CONCURRENT \
     --batch-size $MAX_CONCURRENT \
     --use-cache \
     --config workflows/auto_search_sft.yaml \
-    --config-overrides "search_agent_model_name=$HF_CHECKPOINT_DIR,use_browse_agent=true,search_agent_max_tool_calls=10,browse_tool_name=jina" \
+    --config-overrides "search_agent_model_name=$MODEL_NAME,use_browse_agent=true,search_agent_max_tool_calls=20,browse_tool_name=jina" \
     --output "$EVAL_OUTPUT_DIR/${DATASET}.jsonl"
 
 # ============================================
 # Run scoring
 # ============================================
 echo "=============================================="
-echo "Running evaluation metrics..."
+echo "Running BrowseComp evaluation..."
 echo "=============================================="
 
-# Run evaluation
 python scripts/evaluate.py $DATASET "$EVAL_OUTPUT_DIR/${DATASET}.jsonl" --grader-model gpt-4o
 
 echo "=============================================="
 echo "Evaluation complete!"
 echo "Results saved to: $EVAL_OUTPUT_DIR"
 echo "=============================================="
-echo ""
-echo "To cleanup servers, run:"
-echo "  screen -S vllm_main -X quit"
-echo "  screen -S vllm_browse -X quit"
-echo "  screen -S mcp_server -X quit"
+
+# Cleanup
+screen -S vllm_main -X quit 2>/dev/null || true
+screen -S vllm_browse -X quit 2>/dev/null || true
+screen -S mcp_server -X quit 2>/dev/null || true
 
