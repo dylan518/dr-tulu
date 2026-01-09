@@ -3,6 +3,8 @@ import asyncio
 import weakref
 import logging
 import os
+import re
+import time
 from typing import Any, Dict, Optional, List
 
 import jsonlines
@@ -15,8 +17,41 @@ litellm.drop_params = True
 LOGGER = logging.getLogger(__name__)
 
 
+def _maybe_enable_litellm_debug() -> None:
+    """Enable LiteLLM debug logging if requested via env var.
+
+    LiteLLM debug can be very noisy; we gate it behind `LITELLM_DEBUG=1`.
+    """
+    if os.environ.get("LITELLM_DEBUG") == "1":
+        try:
+            litellm._turn_on_debug()
+        except Exception as e:
+            LOGGER.warning(f"Failed to enable LiteLLM debug: {e}")
+
+
+def _enforce_disallow_openai(model_name: str) -> None:
+    """Fail fast if the caller attempted to use OpenAI/Azure models.
+
+    Set `DISALLOW_OPENAI=1` to make any such usage an immediate error rather than
+    a silent fallback / accidental spend.
+    """
+    if os.environ.get("DISALLOW_OPENAI") != "1":
+        return
+    mn = (model_name or "").strip()
+    if mn.startswith("openai/") or mn.startswith("gpt-") or mn.startswith("azure/"):
+        raise RuntimeError(f"DISALLOW_OPENAI=1 but model_name={mn!r} looks like an OpenAI/Azure model")
+
+
+_maybe_enable_litellm_debug()
+
+
 # Per-event-loop concurrency control for LiteLLM async calls to avoid event loop binding issues
 _LITELLM_SEMAPHORES = weakref.WeakKeyDictionary()
+
+# Optional token usage logging (helps estimate TPM / quota pressure)
+_LITELLM_USAGE_WINDOW_START = None  # type: Optional[float]
+_LITELLM_USAGE_TOTAL_TOKENS = 0
+_LITELLM_USAGE_NUM_CALLS = 0
 
 
 def _get_litellm_semaphore() -> asyncio.Semaphore:
@@ -34,33 +69,108 @@ def _get_litellm_semaphore() -> asyncio.Semaphore:
 
 
 def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
-    json_end = response.rfind("}") + 1
+    """
+    Extract a JSON-like dict from an LLM response.
+
+    Gemini sometimes returns "almost JSON" such as:
+      ```json
+      { score: 1 }
+      ```
+    which is not strict JSON (bare keys). We try strict JSON first, then apply safe
+    normalizations (strip code fences, quote bare keys, remove trailing commas),
+    and finally fall back to yaml.safe_load (YAML is a superset that can parse bare keys).
+    """
+    if not response:
+        return None
+
+    # Strip Markdown code fences if present (```json ... ```).
+    text = response.strip()
+    if text.startswith("```"):
+        # remove leading ```lang and trailing ```
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    json_end = text.rfind("}") + 1
     if json_end == 0:
         return None
-    
+
     # Try to find valid JSON by testing different starting positions
-    json_start = response.find("{")
+    json_start = text.find("{")
     while json_start != -1 and json_start < json_end:
-        json_str = response[json_start:json_end]
-        
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
+        candidate = text[json_start:json_end]
+
+        def _postprocess_obj(o: Any) -> Optional[Dict[str, Any]]:
+            if not isinstance(o, dict):
+                return None
+            # Normalize keys like score" (Gemini sometimes emits `"score":` missing the first quote -> `score":`)
+            fixed: Dict[str, Any] = {}
+            for k, v in o.items():
+                if isinstance(k, str):
+                    kk = k.strip()
+                    # Strip any surrounding quotes
+                    if (kk.startswith('"') and kk.endswith('"')) or (kk.startswith("'") and kk.endswith("'")):
+                        kk = kk[1:-1].strip()
+                    # Strip dangling quotes on one side (e.g., score")
+                    kk = kk.strip('"').strip("'").strip()
+                    fixed[kk] = v
+                else:
+                    fixed[k] = v
+            return fixed
+
+        def _try_json(s: str) -> Optional[Dict[str, Any]]:
             try:
-                # Clean the JSON string of potential invisible characters and extra whitespace
-                cleaned_json = json_str.strip().encode('utf-8').decode('utf-8-sig')
-                return json.loads(cleaned_json)
+                obj = json.loads(s)
+                return _postprocess_obj(obj)
             except json.JSONDecodeError:
-                try:
-                    # Fix doubled braces (e.g., '{{' -> '{', '}}' -> '}')
-                    fixed_braces = json_str.replace('{{', '{').replace('}}', '}')
-                    return json.loads(fixed_braces)
-                except json.JSONDecodeError:
-                    # Try next { position
-                    json_start = response.find("{", json_start + 1)
-                    continue
-        break
-    
+                return None
+
+        # 1) Strict JSON
+        obj = _try_json(candidate)
+        if obj is not None:
+            return obj
+
+        # 2) Clean BOM/whitespace and retry
+        cleaned = candidate.strip().encode("utf-8").decode("utf-8-sig")
+        obj = _try_json(cleaned)
+        if obj is not None:
+            return obj
+
+        # 3) Fix doubled braces
+        fixed_braces = cleaned.replace("{{", "{").replace("}}", "}")
+        obj = _try_json(fixed_braces)
+        if obj is not None:
+            return obj
+
+        # 4) Normalize "JSON-ish" to JSON:
+        #    - quote bare keys: { score: 1 } -> { "score": 1 }
+        #    - remove trailing commas
+        #    - normalize Python literals to JSON
+        normalized = fixed_braces
+        # Fix cases like: { score": 2 } (missing leading quote)
+        normalized = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\"(\s*:)", r"\1\2\3", normalized)
+        normalized = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)", r'\1"\2"\3', normalized)
+        normalized = re.sub(r",(\s*[}\]])", r"\1", normalized)
+        normalized = re.sub(r"\bNone\b", "null", normalized)
+        normalized = re.sub(r"\bTrue\b", "true", normalized)
+        normalized = re.sub(r"\bFalse\b", "false", normalized)
+        obj = _try_json(normalized)
+        if obj is not None:
+            return obj
+
+        # 5) YAML fallback (safe) – handles bare keys and some minor formatting issues.
+        try:
+            import yaml  # type: ignore
+
+            yobj = yaml.safe_load(candidate)
+            yfixed = _postprocess_obj(yobj)
+            if yfixed is not None:
+                return yfixed
+        except Exception:
+            pass
+
+        # Try next { position
+        json_start = text.find("{", json_start + 1)
+
     LOGGER.warning(f"Could not decode JSON from response: {repr(response)}")
     return None
 
@@ -201,14 +311,30 @@ def run_litellm(
         The response content from the model
     """
 
+    _enforce_disallow_openai(model_name)
+
     # Set default parameters
-    chat_kwargs["temperature"] = chat_kwargs.get("temperature", 0)
-    chat_kwargs["max_tokens"] = chat_kwargs.get("max_tokens", 800)
+    # GPT-5 family enforces temperature=1 on OpenAI; setting 0 will error.
+    if "gpt-5" in (model_name or ""):
+        chat_kwargs["temperature"] = chat_kwargs.get("temperature", 1)
+        if chat_kwargs.get("temperature", 1) == 0:
+            chat_kwargs["temperature"] = 1
+    else:
+        chat_kwargs["temperature"] = chat_kwargs.get("temperature", 0)
+    # OpenAI GPT-5 family uses `max_completion_tokens` (and rejects `max_tokens`).
+    # Keep backward compatibility for other providers/models.
+    if "gpt-5" in (model_name or ""):
+        chat_kwargs["max_completion_tokens"] = chat_kwargs.get("max_completion_tokens", chat_kwargs.get("max_tokens", 800))
+        chat_kwargs.pop("max_tokens", None)
+    else:
+        chat_kwargs["max_tokens"] = chat_kwargs.get("max_tokens", 800)
     chat_kwargs["top_p"] = chat_kwargs.get("top_p", 1.0)
     chat_kwargs["frequency_penalty"] = chat_kwargs.get("frequency_penalty", 0.0)
     chat_kwargs["presence_penalty"] = chat_kwargs.get("presence_penalty", 0.0)
     chat_kwargs["num_retries"] = chat_kwargs.get("num_retries", 5)
-    chat_kwargs["fallbacks"] = chat_kwargs.get("fallbacks", ["gpt-4.1-mini"])
+    # Default to no fallbacks to avoid silently routing requests to a different provider/model.
+    # (Callers can still explicitly pass `fallbacks=[...]` if desired.)
+    chat_kwargs["fallbacks"] = chat_kwargs.get("fallbacks", [])
 
     # Prepare messages
     msgs = (
@@ -258,9 +384,24 @@ async def run_litellm_async(
         The response content from the model
     """
 
+    _enforce_disallow_openai(model_name)
+
     # Set default parameters
-    chat_kwargs["temperature"] = chat_kwargs.get("temperature", 0)
-    chat_kwargs["max_tokens"] = chat_kwargs.get("max_tokens", 16384)
+    # GPT-5 family enforces temperature=1 on OpenAI; setting 0 will error.
+    if "gpt-5" in (model_name or ""):
+        chat_kwargs["temperature"] = chat_kwargs.get("temperature", 1)
+        if chat_kwargs.get("temperature", 1) == 0:
+            chat_kwargs["temperature"] = 1
+    else:
+        chat_kwargs["temperature"] = chat_kwargs.get("temperature", 0)
+    # OpenAI GPT-5 family uses `max_completion_tokens` (and rejects `max_tokens`).
+    if "gpt-5" in (model_name or ""):
+        chat_kwargs["max_completion_tokens"] = chat_kwargs.get(
+            "max_completion_tokens", chat_kwargs.get("max_tokens", 16384)
+        )
+        chat_kwargs.pop("max_tokens", None)
+    else:
+        chat_kwargs["max_tokens"] = chat_kwargs.get("max_tokens", 16384)
     chat_kwargs["top_p"] = chat_kwargs.get("top_p", 1.0)
     chat_kwargs["frequency_penalty"] = chat_kwargs.get("frequency_penalty", 0.0)
     chat_kwargs["presence_penalty"] = chat_kwargs.get("presence_penalty", 0.0)
@@ -295,6 +436,52 @@ async def run_litellm_async(
                 model=model_name,
                 **chat_kwargs,
             )
+
+            # Optional: print a rolling TPM estimate (very useful for diagnosing 429/RESOURCE_EXHAUSTED).
+            # Enable with: LITELLM_LOG_USAGE=1
+            if os.environ.get("LITELLM_LOG_USAGE") == "1":
+                global _LITELLM_USAGE_WINDOW_START, _LITELLM_USAGE_TOTAL_TOKENS, _LITELLM_USAGE_NUM_CALLS
+                if _LITELLM_USAGE_WINDOW_START is None:
+                    _LITELLM_USAGE_WINDOW_START = time.time()
+
+                usage = getattr(response, "usage", None)
+                prompt_tokens = completion_tokens = total_tokens = None
+                if usage is not None:
+                    # LiteLLM may return usage as dict-like or object-like.
+                    if isinstance(usage, dict):
+                        prompt_tokens = usage.get("prompt_tokens")
+                        completion_tokens = usage.get("completion_tokens")
+                        total_tokens = usage.get("total_tokens")
+                    else:
+                        prompt_tokens = getattr(usage, "prompt_tokens", None)
+                        completion_tokens = getattr(usage, "completion_tokens", None)
+                        total_tokens = getattr(usage, "total_tokens", None)
+
+                if total_tokens is None:
+                    # Fallback: at least count something to avoid divide-by-zero; if usage is missing,
+                    # we don't know exact tokens so we skip accounting.
+                    total_tokens = 0
+
+                _LITELLM_USAGE_TOTAL_TOKENS += int(total_tokens or 0)
+                _LITELLM_USAGE_NUM_CALLS += 1
+
+                now = time.time()
+                elapsed = max(1e-6, now - (_LITELLM_USAGE_WINDOW_START or now))
+                tpm_est = int((_LITELLM_USAGE_TOTAL_TOKENS / elapsed) * 60.0)
+
+                every_n = int(os.environ.get("LITELLM_LOG_USAGE_EVERY", "50"))
+                if _LITELLM_USAGE_NUM_CALLS % max(1, every_n) == 0:
+                    rpm_est = int((_LITELLM_USAGE_NUM_CALLS / elapsed) * 60.0)
+                    avg_tokens_per_call = (
+                        (_LITELLM_USAGE_TOTAL_TOKENS / max(1, _LITELLM_USAGE_NUM_CALLS))
+                        if _LITELLM_USAGE_NUM_CALLS > 0
+                        else 0.0
+                    )
+                    LOGGER.warning(
+                        f"[LiteLLM usage] model={model_name!r} calls={_LITELLM_USAGE_NUM_CALLS} "
+                        f"window_tokens={_LITELLM_USAGE_TOTAL_TOKENS} elapsed_s={elapsed:.1f} "
+                        f"est_rpm={rpm_est} est_tpm={tpm_est} avg_tokens_per_call={avg_tokens_per_call:.0f}"
+                    )
     except Exception as e:
         # if we get an error, return an empty string
         print(f"Error in run_litellm_async: {e}")

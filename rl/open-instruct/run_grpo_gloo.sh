@@ -16,6 +16,13 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0,virbr0}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export MCP_TRANSPORT_PORT=8003
 
+# LiteLLM (LLM judge) throttling:
+# If you see LiteLLM RateLimitError / HTTP 429 / RESOURCE_EXHAUSTED, lower concurrency here.
+# (Default inside the code is 256 concurrent calls which can easily trip provider quotas.)
+export LITELLM_MAX_CONCURRENT_CALLS="${LITELLM_MAX_CONCURRENT_CALLS:-8}"
+# Optional: very noisy but useful to debug provider routing / retries
+# export LITELLM_DEBUG=1
+
 output_dir="/home/ubuntu/dr-tulu/rl_runs/dr_tulu_grpo_eval30_1767911717/dr_tulu_grpo_debug_threadstall_eval30__22__1767911726"
 mkdir -p "${output_dir}"
 
