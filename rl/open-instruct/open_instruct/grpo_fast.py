@@ -662,7 +662,7 @@ class PolicyTrainerRayProcess(RayProcess):
             model_config.model_name_or_path,
             revision=model_config.model_revision,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=model_config.attn_implementation,
             use_cache=False,
         )
         disable_dropout_in_model(self.policy)
@@ -733,7 +733,7 @@ class PolicyTrainerRayProcess(RayProcess):
             model_config.model_name_or_path,
             revision=model_config.model_revision,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=model_config.attn_implementation,
             use_cache=False,
         )
         disable_dropout_in_model(self.ref_policy)

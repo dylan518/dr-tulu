@@ -56,9 +56,16 @@ class ModelConfig:
     """The specific model version to use (can be a branch name, tag name or commit id)."""
     torch_dtype: Optional[str] = None
     """Override the default `torch.dtype` and load the model under this dtype."""
-    attn_implementation: Optional[Literal["flash_attention_2"]] = None
-    """Which attention implementation to use; you can run --attn_implementation=flash_attention_2, in which case
-    you must install this manually by running `pip install flash-attn --no-build-isolation`"""
+    attn_implementation: Optional[Literal["flash_attention_2", "sdpa", "eager"]] = "flash_attention_2"
+    """Which attention implementation to use.
+
+    - `flash_attention_2`: Requires the `flash-attn` package (FlashAttention-2 kernels).
+    - `sdpa`: Uses PyTorch's scaled dot-product attention backend (no `flash-attn` dependency).
+    - `eager`: Uses the plain (unfused) attention implementation.
+
+    If you hit GPU kernel faults (e.g., NVRM Xid 13) and suspect FlashAttention, try
+    `--attn_implementation sdpa` or `--attn_implementation eager` to confirm.
+    """
     use_cache: Optional[bool] = None
     """Whether to use cache in the model."""
     gradient_checkpointing: bool = False
