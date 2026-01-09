@@ -351,10 +351,14 @@ Your JSON Evaluation:"""
             overall_total_weight += rubric["weight"]
         if rubric_type == "persistent":
             persistent_total_score += score * rubric["weight"]
-            persistent_total_weight += rubric["weight"]
+            # Only count positive weights in denominator to avoid scores > 1.0 when negative rubrics exist
+            if rubric["weight"] > 0:
+                persistent_total_weight += rubric["weight"]
         elif rubric_type == "adaptive":
             adaptive_total_score += score * rubric["weight"]
-            adaptive_total_weight += rubric["weight"]
+            # Only count positive weights in denominator to avoid scores > 1.0 when negative rubrics exist
+            if rubric["weight"] > 0:
+                adaptive_total_weight += rubric["weight"]
     
     # Compute weighted average for each rubric key group
     for rubric_key, group_data in title_groups.items():

@@ -57,7 +57,8 @@ def _score_property(response: str, question: str, prop: str, system_prompt: str 
         # Validate that score is a number
         try:
             score = float(obj["score"])
-            return score / score_scale
+            # Clamp to [0, 1] in case LLM returns out-of-range values
+            return max(0.0, min(1.0, score / score_scale))
         except (ValueError, TypeError) as e:
             LOGGER.warning(f"Invalid score value in response: {obj['score']}, error: {e}")
             return 0.0
@@ -108,7 +109,8 @@ Return a score on a scale of 0 to 2 indicating how appropriate the response is b
         # Validate that score is a number
         try:
             score = float(obj["score"])
-            return score / score_scale
+            # Clamp to [0, 1] in case LLM returns out-of-range values
+            return max(0.0, min(1.0, score / score_scale))
         except (ValueError, TypeError) as e:
             LOGGER.warning(f"Invalid score value in response: {obj['score']}, error: {e}")
             return 0.0
@@ -272,7 +274,8 @@ Return a score on a scale of 0 to 2 indicating how appropriate the response is b
             for span in spans:
                 print("Span included in the response: ", span in response)
             print("Tagged response ratio: ", len(" ".join(spans)) / len(response))
-            return score / 2.0, spans
+            # Clamp to [0, 1] in case LLM returns out-of-range values
+            return max(0.0, min(1.0, score / 2.0)), spans
         except (ValueError, TypeError) as e:
             LOGGER.warning(f"Invalid score value in rubric span tag response: {obj['score']}, error: {e}")
             return 0.0, []
