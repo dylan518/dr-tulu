@@ -638,7 +638,16 @@ class PolicyTrainerRayProcess(RayProcess):
         self.wandb_url = wandb_url
         torch.cuda.set_device(self.local_rank)
         self.device = torch.device(self.local_rank)
-        deepspeed.init_distributed()
+        # NOTE: We sometimes see NCCL segfaults early during init (e.g. in ncclTopoCheckNet()) on some
+        # systems / driver stacks. Allow overriding the torch distributed backend via env var so we can
+        # force gloo as a mitigation.
+        # Example:
+        #   export DR_TULU_DEEPSPEED_DIST_BACKEND=gloo
+        _dist_backend = os.environ.get("DR_TULU_DEEPSPEED_DIST_BACKEND")
+        if _dist_backend:
+            deepspeed.init_distributed(dist_backend=_dist_backend)
+        else:
+            deepspeed.init_distributed()
 
         ds_config = get_train_ds_config(
             offload=False,
@@ -1671,6 +1680,28 @@ def launch_mcp_subprocess(run_mcp_command: str, output_dir: str) -> Optional[sub
         Popen object if launched, None otherwise
     """
     print(f"🚀 Launching MCP server subprocess: {run_mcp_command}")
+
+    # If the MCP port is already bound, do NOT try to launch another server.
+    # This commonly happens when a previous run was interrupted (Ctrl-C) and left the MCP process alive,
+    # or when multiple jobs share the same MCP_TRANSPORT_PORT.
+    # In that case, we simply reuse the existing server.
+    try:
+        import re
+        import socket
+
+        port_match = re.search(r"--port\\s+(\\d+)", run_mcp_command)
+        host_match = re.search(r"--host\\s+([^\\s]+)", run_mcp_command)
+        port = int(port_match.group(1)) if port_match else int(os.environ.get("MCP_TRANSPORT_PORT", "8000"))
+        host = host_match.group(1) if host_match else os.environ.get("MCP_TRANSPORT_HOST", "0.0.0.0")
+        # If server binds to 0.0.0.0, probe localhost
+        probe_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex((probe_host, port)) == 0:
+                print(f"♻️  MCP port {port} already in use on {probe_host}; reusing existing MCP server.")
+                return None
+    except Exception as e:
+        print(f"⚠️  Warning: could not check MCP port availability: {e}")
     
     # Debug: Check if fastmcp command exists
     try:

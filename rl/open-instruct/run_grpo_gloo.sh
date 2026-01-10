@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export OPEN_INSTRUCT_MCP_DEBUG_NO_CALLS=1
 
 # This repo expects you to run via `uv` so dependency versions (and optional compiled deps like flash-attn)
 # match what DR-Tulu/Open-Instruct was tested with.
@@ -7,6 +8,30 @@ set -euo pipefail
 # Note: your crash is a NCCL SIGSEGV inside `ncclTopoCheckNet()` (see Ray worker *.err logs).
 # On machines without IB / with UCX present, a common workaround is to force NCCL to use sockets.
 # You can override any of these externally.
+export LITELLM_LOG_USAGE=1
+export LITELLM_LOG_USAGE_EVERY=20
+export OPEN_INSTRUCT_MCP_NORMALIZE_TOOL_CALLS=0
+
+# Gemini (LiteLLM) rate limiting:
+# Set this to cap estimated throughput. For strictest adherence, also set LITELLM_MAX_CONCURRENT_CALLS=1.
+export LITELLM_MAX_TPM="${LITELLM_MAX_TPM:-350000}"
+export LITELLM_TPM_WINDOW_SECONDS="${LITELLM_TPM_WINDOW_SECONDS:-60}"
+
+# MCP tools to enable:
+# - `browse_webpage` requires Crawl4AI credentials (CRAWL4AI_API_KEY + usually CRAWL4AI_API_URL).
+#   If those are not set, calls to browse_webpage will fail with:
+#     "CRAWL4AI_API_KEY is not set"
+# Default to search-only tools; opt-in to browsing by setting MCP_TOOL_NAMES.
+export MCP_TOOL_NAMES="${MCP_TOOL_NAMES:-snippet_search,google_search}"
+
+# Ensure rubric judge / adaptive rubric generation doesn't silently default to OpenAI gpt-4.1.
+# These are used in `open_instruct/search_rewards/utils/rubric_utils.py`.
+export LLM_JUDGE_MODEL="${LLM_JUDGE_MODEL:-gemini/gemini-2.5-flash}"
+export RUBRIC_JUDGE_MODEL="${RUBRIC_JUDGE_MODEL:-$LLM_JUDGE_MODEL}"
+export RUBRIC_GENERATION_MODEL="${RUBRIC_GENERATION_MODEL:-$LLM_JUDGE_MODEL}"
+# Optional safety: if set, any accidental OpenAI/Azure model usage will hard error instead of silently routing.
+# export DISALLOW_OPENAI=1
+
 export DR_TULU_DEEPSPEED_DIST_BACKEND=gloo
 export NCCL_IB_DISABLE
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
@@ -47,7 +72,7 @@ uv run --extra compile python -u open_instruct/grpo_fast.py \
   --dataset_local_cache_dir /home/ubuntu/dr-tulu/rl/open-instruct/local_dataset_cache \
   --max_token_length 18240 \
   --max_prompt_token_length 3000 \
-  --system_prompt_file open_instruct/search_utils/system_prompts/unified_tool_calling_v20250907_no_snippet.yaml \
+  --system_prompt_file open_instruct/search_utils/system_prompts/unified_tool_calling_v20250907.yaml \
   --exp_name dr_tulu_grpo_debug_threadstall_eval30 \
   --seed 22 \
   --run_name dr_tulu_grpo_debug_threadstall_eval30__22__1767911726 \
@@ -64,7 +89,6 @@ uv run --extra compile python -u open_instruct/grpo_fast.py \
   --temperature 1.0 \
   --num_unique_prompts_rollout 16 \
   --num_samples_per_prompt_rollout 8 \
-  --num_samples_per_prompt_eval 8 \
   --beta 0.001 \
   --clip_lower 0.2 \
   --clip_higher 0.2 \
@@ -77,7 +101,7 @@ uv run --extra compile python -u open_instruct/grpo_fast.py \
   --apply_verifiable_reward \
   --verification_reward 10.0 \
   --verifier_strategy judge \
-  --llm_judge_model gemini/gemini-2.5-flash-lite \
+  --llm_judge_model "${LLM_JUDGE_MODEL}" \
   --llm_judge_max_tokens 2048 \
   --llm_judge_temperature 1.0 \
   --llm_judge_timeout 60 \
@@ -87,7 +111,6 @@ uv run --extra compile python -u open_instruct/grpo_fast.py \
   --vllm_tensor_parallel_size 1 \
   --vllm_enforce_eager True \
   --vllm_sync_backend gloo \
-  --vllm_sync_timeout_seconds 240 \
   --vllm_gpu_memory_utilization 0.8 \
   --vllm_top_p 0.9 \
   --deepspeed_stage 3 \
@@ -100,7 +123,7 @@ uv run --extra compile python -u open_instruct/grpo_fast.py \
   --mask_tool_use True \
   --tool_max_concurrency 32 \
   --number_documents_to_search 10 \
-  --mcp_tool_names google_search \
+  --mcp_tool_names "${MCP_TOOL_NAMES}" \
   --mcp_parser_name v20250824 \
   --mcp_server_command "uv run python -m dr_agent.mcp_backend.main --transport http --port 8003 --host 0.0.0.0 --path /mcp" \
   --mcp_timeout 180 \

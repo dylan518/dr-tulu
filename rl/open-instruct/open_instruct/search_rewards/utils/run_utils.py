@@ -4,7 +4,9 @@ import weakref
 import logging
 import os
 import re
+import atexit
 import time
+from collections import deque
 from typing import Any, Dict, Optional, List
 
 import jsonlines
@@ -15,6 +17,21 @@ from openai import AzureOpenAI
 litellm.drop_params = True
 
 LOGGER = logging.getLogger(__name__)
+
+# When the Python interpreter is shutting down (Ray worker teardown, SIGTERM, Ctrl-C during shutdown),
+# LiteLLM's async implementation may try to schedule work on an executor that has already been
+# torn down, producing:
+#   RuntimeError: cannot schedule new futures after interpreter shutdown
+# Treat this as a shutdown condition and stop issuing further LiteLLM requests.
+_LITELLM_SHUTTING_DOWN = False
+
+
+def _mark_litellm_shutting_down() -> None:
+    global _LITELLM_SHUTTING_DOWN
+    _LITELLM_SHUTTING_DOWN = True
+
+
+atexit.register(_mark_litellm_shutting_down)
 
 
 def _maybe_enable_litellm_debug() -> None:
@@ -66,6 +83,96 @@ def _get_litellm_semaphore() -> asyncio.Semaphore:
         sem = asyncio.Semaphore(max_concurrent)
         _LITELLM_SEMAPHORES[loop] = sem
     return sem
+
+
+class _TpmLimiter:
+    """Sliding-window TPM limiter (async).
+
+    This is best-effort and uses an estimated token count per request to decide when to wait.
+    For safety (avoid 429), the estimate is intentionally conservative.
+    """
+
+    def __init__(self, tpm_limit: int, window_seconds: float = 60.0):
+        self.tpm_limit = int(tpm_limit)
+        self.window_seconds = float(window_seconds)
+        self._events: deque[tuple[float, int]] = deque()  # (timestamp, tokens)
+        self._lock = asyncio.Lock()
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+    def _sum_tokens(self) -> int:
+        return sum(t for _, t in self._events)
+
+    async def acquire(self, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        while True:
+            async with self._lock:
+                now = time.time()
+                self._prune(now)
+                used = self._sum_tokens()
+                if used + tokens <= self.tpm_limit:
+                    self._events.append((now, tokens))
+                    return
+
+                # Wait until enough old tokens expire.
+                target = self.tpm_limit - tokens
+                running = used
+                wait_until = now + self.window_seconds
+                for ts, t in self._events:
+                    running -= t
+                    if running <= target:
+                        wait_until = ts + self.window_seconds
+                        break
+                sleep_s = max(0.01, wait_until - now)
+            await asyncio.sleep(sleep_s)
+
+
+_LITELLM_TPM_LIMITERS = weakref.WeakKeyDictionary()
+
+
+def _get_litellm_tpm_limiter() -> Optional[_TpmLimiter]:
+    """Return a per-event-loop TPM limiter if enabled via env var `LITELLM_MAX_TPM`."""
+    tpm = os.environ.get("LITELLM_MAX_TPM")
+    if not tpm:
+        return None
+    try:
+        tpm_limit = int(float(tpm))
+    except Exception:
+        return None
+    if tpm_limit <= 0:
+        return None
+
+    loop = asyncio.get_running_loop()
+    limiter = _LITELLM_TPM_LIMITERS.get(loop)
+    if limiter is None:
+        window_s = float(os.environ.get("LITELLM_TPM_WINDOW_SECONDS", "60"))
+        limiter = _TpmLimiter(tpm_limit=tpm_limit, window_seconds=window_s)
+        _LITELLM_TPM_LIMITERS[loop] = limiter
+    return limiter
+
+
+def _estimate_request_tokens_for_tpm(messages: List[Dict[str, str]], chat_kwargs: Dict[str, Any]) -> int:
+    """Conservative token estimate for TPM limiting (Gemini tokenizer not available here)."""
+    prompt_chars = 0
+    for m in messages or []:
+        prompt_chars += len(m.get("content") or "")
+
+    # Conservative: assume ~2 chars per token
+    prompt_tokens_est = max(1, prompt_chars // 2)
+
+    max_out = chat_kwargs.get("max_tokens")
+    if max_out is None:
+        max_out = chat_kwargs.get("max_completion_tokens")
+    try:
+        max_out_i = int(max_out) if max_out is not None else 0
+    except Exception:
+        max_out_i = 0
+
+    return int(prompt_tokens_est + max(0, max_out_i))
 
 
 def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
@@ -386,6 +493,10 @@ async def run_litellm_async(
 
     _enforce_disallow_openai(model_name)
 
+    # Don't try to issue new requests while the worker is exiting.
+    if _LITELLM_SHUTTING_DOWN:
+        return ""
+
     # Set default parameters
     # GPT-5 family enforces temperature=1 on OpenAI; setting 0 will error.
     if "gpt-5" in (model_name or ""):
@@ -428,6 +539,20 @@ async def run_litellm_async(
 
     # Guard concurrent calls with a global semaphore
     try:
+        # Optional strict TPM throttle (primarily for Gemini / Vertex quotas).
+        # Enable with:
+        #   export LITELLM_MAX_TPM=350000
+        # Optionally tune:
+        #   export LITELLM_TPM_WINDOW_SECONDS=60
+        #
+        # This uses a conservative estimate, so it should keep you under the limit, but may
+        # underutilize slightly. For *closest* adherence, also set:
+        #   export LITELLM_MAX_CONCURRENT_CALLS=1
+        if os.environ.get("LITELLM_MAX_TPM") and "gemini" in (model_name or "").lower():
+            limiter = _get_litellm_tpm_limiter()
+            if limiter is not None:
+                await limiter.acquire(_estimate_request_tokens_for_tpm(msgs, chat_kwargs))
+
         semaphore = _get_litellm_semaphore()
         async with semaphore:
             # Create chat completion
@@ -483,7 +608,16 @@ async def run_litellm_async(
                         f"est_rpm={rpm_est} est_tpm={tpm_est} avg_tokens_per_call={avg_tokens_per_call:.0f}"
                     )
     except Exception as e:
-        # if we get an error, return an empty string
+        msg = str(e)
+        # Shutdown race: not a real connectivity problem; happens when the worker is exiting.
+        if (
+            "cannot schedule new futures after interpreter shutdown" in msg
+            or "Event loop is closed" in msg
+        ):
+            _mark_litellm_shutting_down()
+            return ""
+
+        # Otherwise, return empty string (callers treat this as a failed judge call).
         print(f"Error in run_litellm_async: {e}")
         return ""
 

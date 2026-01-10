@@ -6,6 +6,7 @@ import inspect
 import asyncio
 import os
 import time
+import re
 import httpx
 import httpcore
 
@@ -137,6 +138,20 @@ class MCPTool(Tool):
     def __call__(self, prompt: str) -> ToolOutput:
         # the one thing open-instruct needs to do: remove older tool calls.
         trunc_prompt = truncate_at_second_last_stop(prompt, self.stop_strings)
+        # Be forgiving about minor formatting issues in tool-call tags.
+        # In practice, models sometimes emit variants like:
+        #   <call_tool name=google_search>...</call_tool>
+        #   <call_tool name='google_search'>...</call_tool>
+        # or forget the closing tag if generation is interrupted.
+        #
+        # The upstream parsers in `dr_agent` are intentionally strict (they look for exact
+        # `<call_tool name="...">...</call_tool>` / `<tool name="...">...</tool>` patterns),
+        # so we normalize common deviations to avoid spuriously failing with:
+        #   "MCP Tool Error: No valid tool calls found."
+        # Optional normalization (parsing-only). This does NOT change the model's output stored for
+        # training/reward; it only helps the tool wrapper successfully detect and execute a tool call.
+        if os.environ.get("OPEN_INSTRUCT_MCP_NORMALIZE_TOOL_CALLS", "1") == "1":
+            trunc_prompt = _normalize_tool_call_tags(trunc_prompt)
         # work out which mcp tool to call.
         document_tool_output = None
         error = None
@@ -172,6 +187,11 @@ class MCPTool(Tool):
             if error is None and not found_tool:
                 error = "No valid tool calls found."
                 print(f"MCP Tool Error: {error}")
+                # Optional debug: show tail of the (possibly truncated/normalized) prompt so we can
+                # see what the model actually emitted around the stop sequence.
+                if os.environ.get("OPEN_INSTRUCT_MCP_DEBUG_NO_CALLS", "0") == "1":
+                    tail = trunc_prompt[-400:].replace("\n", "\\n")
+                    print(f"MCP Tool Debug (tail): {tail}")
                 return ToolOutput(
                     output=error,
                     called=False,
@@ -217,6 +237,35 @@ class MCPTool(Tool):
             start_str="\n",
             end_str="\n\n",
         )
+
+
+def _normalize_tool_call_tags(text: str) -> str:
+    """
+    Normalize common tool-call tag variants into strict forms expected by dr_agent parsers.
+    """
+    def _normalize_opening_tag(s: str, tag: str) -> str:
+        # Normalize both quoted and unquoted name=... into name="..."
+        pattern = rf"<{tag}\s+([^>]*?)name\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_]+))"
+
+        def _repl(m: re.Match[str]) -> str:
+            tool_name = m.group(2) or m.group(3) or m.group(4) or ""
+            return f'<{tag} {m.group(1)}name="{tool_name}"'
+
+        return re.sub(pattern, _repl, s, flags=re.DOTALL)
+
+    text = _normalize_opening_tag(text, "call_tool")
+    text = _normalize_opening_tag(text, "tool")
+    # Auto-close a trailing, unclosed <call_tool ...> tag (best-effort).
+    # This helps if generation was interrupted before emitting </call_tool>.
+    if "<call_tool" in text and "</call_tool>" not in text and "</call>" not in text:
+        # Only close if there's an opening tag after the last close of other tags.
+        # (Avoid appending closures to unrelated contexts.)
+        if re.search(r"<call_tool\b[^>]*>\s*[^<]*\Z", text, re.DOTALL):
+            text = text + "</call_tool>"
+    if "<tool" in text and "</tool>" not in text:
+        if re.search(r"<tool\b[^>]*>\s*[^<]*\Z", text, re.DOTALL):
+            text = text + "</tool>"
+    return text
 
 
 if __name__ == "__main__":
