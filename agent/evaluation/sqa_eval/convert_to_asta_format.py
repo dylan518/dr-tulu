@@ -5,6 +5,8 @@ from collections import defaultdict
 from typing import Dict, Any, Optional, List
 import argparse
 
+from .trace_normalization import normalize_full_traces
+
 def extract_citations_from_context(context: str) -> Dict[str, str]:
     """
     Extract citations from the context.
@@ -118,14 +120,12 @@ def parse_answer(sample: str) -> List[Dict[str, Any]]:
         if not (sec.strip()[0] == '#' and len(sec.strip().split('\n')) == 1)
     ]
 
-    # get all snippets from the thinking section
-    if '<think>' in sample['full_traces']['generated_text']:
-        snippets = extract_citations_from_context(sample['full_traces']['generated_text'])
-    else:
-        concat_text = "" 
-        for tool_call in sample['full_traces']['tool_calls']:
-            concat_text += tool_call['generated_text'] + "\n"
-        snippets = extract_citations_from_context(concat_text)
+    # Get all snippets from traces.
+    # Different backends (OSS workflow vs MiniMax/API) serialize traces differently, so we normalize.
+    full_traces = sample.get("full_traces") or {}
+    norm = normalize_full_traces(full_traces)
+    concat_text = "\n".join(norm.text_blobs)
+    snippets = extract_citations_from_context(concat_text)
 
     for section in raw_sections:
         title_match = re.match(r"#+\s*([^\n]*)", section)

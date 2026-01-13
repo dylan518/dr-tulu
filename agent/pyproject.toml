@@ -85,3 +85,11 @@ testpaths = "tests"
 addopts = "-v --tb=short"
 markers = "integration: tests requiring real API access"
 asyncio_mode = "auto"
+filterwarnings = [
+    # Python 3.13 + aiohttp: harmless deprecation warning (fixed in newer 3.13 micro releases).
+    "ignore:enable_cleanup_closed ignored.*:DeprecationWarning:aiohttp\\..*",
+    # Pydantic v2: LiteLLM/OpenAI response objects don't always match expected Pydantic schemas exactly.
+    # These are serializer warnings and do not affect test correctness.
+    "ignore:Pydantic serializer warnings.*:UserWarning:pydantic\\..*",
+    "ignore:PydanticSerializationUnexpectedValue.*:UserWarning:pydantic\\..*",
+]

@@ -435,6 +435,26 @@ class MCPSearchTool(MCPMixin, BaseTool, ABC):
         )
         self.number_documents_to_search = number_documents_to_search
 
+    def _generate_tool_schema(self) -> Dict[str, Any]:
+        """
+        Provide an OpenAI tool schema for native tool calling.
+
+        We prefer the MCP-provided schema, but fall back to a minimal `{query: string}` schema
+        so we can still register tools *before* the first MCP schema fetch happens.
+        (vLLM/OpenAI endpoints require a valid JSON schema in the `tools` list.)
+        """
+        mcp_schema = self._get_mcp_tool_schema()
+        if mcp_schema:
+            return mcp_schema
+
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query string"}
+            },
+            "required": ["query"],
+        }
+
     @abstractmethod
     def extract_documents(self, raw_output: Dict[str, Any]) -> List[Document]:
         """
@@ -832,6 +852,25 @@ class MCPBrowseTool(MCPMixin, BaseTool, ABC):
         self.use_localized_snippets = use_localized_snippets
         self.context_chars = context_chars
 
+    def _generate_tool_schema(self) -> Dict[str, Any]:
+        """
+        Provide an OpenAI tool schema for native tool calling.
+
+        Prefer MCP-provided schema, otherwise fall back to `{url: string}` so native tool calling
+        can work even before the first schema fetch.
+        """
+        mcp_schema = self._get_mcp_tool_schema()
+        if mcp_schema:
+            return mcp_schema
+
+        return {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to fetch/browse"}
+            },
+            "required": ["url"],
+        }
+
     def _create_error_output(
         self,
         error_msg: str,
@@ -996,7 +1035,16 @@ class MCPBrowseTool(MCPMixin, BaseTool, ABC):
 
         if isinstance(tool_input, dict):
             # Native mode: dict with url parameter
-            url = tool_input.get("url", "")
+            # Accept common aliases emitted by different tool-call parsers / models:
+            # - OpenAI-style tools often use "url"
+            # - Our MCP schemas historically used "webpage_url"
+            # - Some models emit "link" / camelCase variants
+            url = (
+                tool_input.get("url", "")
+                or tool_input.get("webpage_url", "")
+                or tool_input.get("webpageUrl", "")
+                or tool_input.get("link", "")
+            )
             if not url:
                 return self._create_error_output(
                     "No URL provided in tool call.",
@@ -1394,9 +1442,10 @@ class Crawl4AIBrowseTool(MCPBrowseTool):
         self.use_pruning = use_pruning
         self.bm25_query = bm25_query
         self.bypass_cache = bypass_cache
-        self.timeout_ms = (
-            max(0, (timeout - 1)) * 1000
-        )  # make sure crawl4ai timeout is shorter than MCP timeout
+        # Crawl4AI internal timeout (ms). Keep it below MCP timeout, and cap it
+        # to a conservative default to avoid long hangs.
+        # Tests expect 80s default behavior.
+        self.timeout_ms = min(80000, max(0, (timeout - 1)) * 1000)
         self.include_html = include_html
         self.use_docker_version = use_docker_version
         self.use_ai2_config = use_ai2_config
@@ -1610,7 +1659,16 @@ class MCPRerankerTool(MCPMixin, BaseTool, ABC):
 
         # Step 5: Build parameters and execute MCP call
         params = self.get_mcp_params(query, document_texts, effective_top_n)
-        raw_output = await self._execute_mcp_call(self.get_mcp_tool_name(), params)
+        try:
+            raw_output = await self._execute_mcp_call(self.get_mcp_tool_name(), params)
+        except Exception as e:
+            return self._create_error_output(
+                f"Error processing {self.__class__.__name__}: {e}",
+                call_id,
+                time.time() - start_time,
+                input_documents=tool_input.documents,
+                raw_output=None,
+            )
 
         # Step 6: Check for execution errors
         if error := raw_output.get("error"):
@@ -1745,8 +1803,13 @@ class VllmHostedRerankerTool(MCPRerankerTool):
         for result in reranked_results:
             if isinstance(result, dict):
                 # Extract index and score from reranker result
-                doc_index = int(result.get("index"))
-                rerank_score = result.get("relevance_score", 0.0)
+                idx_val = result.get("index")
+                try:
+                    doc_index = int(idx_val)
+                except (TypeError, ValueError):
+                    continue
+
+                rerank_score = result.get("relevance_score", 0.0) or 0.0
 
                 # Get the original document by index
                 if doc_index is not None and 0 <= doc_index < len(original_documents):

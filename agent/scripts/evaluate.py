@@ -36,6 +36,7 @@ from evaluation.samplers.sampler.chat_completion_sampler import (
 )
 from evaluation.short_form_qa_eval.short_form_eval import ShortFormQAEval
 from evaluation.simple_qa_eval.simpleqa_eval import SimpleQAEval
+from evaluation.scholarqa_cs2_eval.scholarqa_cs2_eval import ScholarQACS2Eval
 
 load_dotenv()
 
@@ -235,6 +236,8 @@ def run_evaluation(
         eval_class = ShortFormQAEval(
             task=task, grader_model=grader_sampler, metric="judge"
         )
+    elif task in ["scholarqa_cs2", "scholarqa-cs2"]:
+        eval_class = ScholarQACS2Eval(grader_model=grader_sampler)
     else:
         raise ValueError(f"Unsupported task type: {task}")
 

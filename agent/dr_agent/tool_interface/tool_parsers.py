@@ -527,3 +527,118 @@ def create_tool_parser(parser_type: str | None, **parser_args) -> ToolCallParser
         )
 
     return parser_class(**filtered_args)
+
+
+@register_parser("minimax_xml")
+class MiniMaxXMLToolCallParser(ToolCallParser):
+    """
+    Parser for MiniMax M2.1-style XML tool calling.
+
+    Expected output pattern (simplified):
+      <minimax:tool_call>
+        <invoke name="TOOL_NAME">
+          <parameter name="query">...</parameter>
+          <parameter name="limit">8</parameter>
+        </invoke>
+      </minimax:tool_call>
+
+    Notes:
+    - We treat the "main" content as query/url/input/text/content if present, otherwise first parameter value.
+    - Other parameters are returned as ToolCallInfo.parameters (strings).
+    """
+
+    def __init__(self):
+        pass
+
+    @property
+    def stop_sequences(self) -> List[str]:
+        # Stop after the tool call block completes
+        return ["</minimax:tool_call>"]
+
+    def has_calls(self, text: str, tool_name: str) -> bool:
+        # Look for an <invoke name="tool_name"> inside a minimax tool_call block
+        pattern = (
+            r"<minimax:tool_call>\s*"
+            r"(?:.|\n)*?"
+            r'<invoke\s+name=["\']'
+            + re.escape(tool_name)
+            + r'["\']\s*>'
+        )
+        return bool(re.search(pattern, text, re.DOTALL))
+
+    def parse_call(self, text: str, tool_name: str) -> Optional[ToolCallInfo]:
+        # Find the first matching invoke block for this tool_name
+        pattern = (
+            r"(<minimax:tool_call>\s*(?:.|\n)*?"
+            r'<invoke\s+name=["\']'
+            + re.escape(tool_name)
+            + r'["\']\s*>'
+            r"(?:.|\n)*?</invoke>\s*(?:.|\n)*?</minimax:tool_call>)"
+        )
+        match = re.search(pattern, text, re.DOTALL)
+        if not match:
+            return None
+
+        full_block = match.group(1)
+
+        # Extract parameters from <parameter name="x">value</parameter>
+        params: Dict[str, Any] = {}
+        for p_match in re.finditer(
+            r'<parameter\s+name=["\']([^"\']+)["\']\s*>(.*?)</parameter>',
+            full_block,
+            re.DOTALL,
+        ):
+            key = p_match.group(1).strip()
+            val = p_match.group(2).strip()
+            params[key] = val
+
+        # Choose main content
+        content_key = next(
+            (k for k in ["query", "webpage_url", "url", "input", "text", "content"] if k in params),
+            None,
+        )
+        if content_key is not None:
+            content = str(params.pop(content_key))
+        elif len(params) == 1:
+            only_key = next(iter(params.keys()))
+            content = str(params.pop(only_key))
+        else:
+            content = ""
+
+        return ToolCallInfo(
+            content=content,
+            parameters=params,
+            start_pos=match.start(1),
+            end_pos=match.end(1),
+        )
+
+    def format_result(self, formatted_output: str, output: "ToolOutput") -> str:
+        # Keep our existing tool output wrapper; inside we already emit <snippet>/<webpage> blocks.
+        return f"<tool_output>{formatted_output}</tool_output>"
+
+    def format_tool_call(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        main_parameter: Optional[str] = None,
+    ) -> str:
+        # Render a minimax tool_call for debugging / symmetry with other parsers.
+        if main_parameter and main_parameter in arguments:
+            content_key = main_parameter
+        else:
+            content_key = next(
+                (k for k in ["query", "webpage_url", "url", "input", "text", "content"] if k in arguments),
+                None,
+            )
+
+        param_lines: List[str] = []
+        for k, v in arguments.items():
+            param_lines.append(f'    <parameter name="{k}">{v}</parameter>')
+
+        return (
+            "<minimax:tool_call>\n"
+            f'  <invoke name="{tool_name}">\n'
+            + "\n".join(param_lines)
+            + "\n  </invoke>\n"
+            "</minimax:tool_call>"
+        )

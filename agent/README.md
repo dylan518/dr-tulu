@@ -59,6 +59,70 @@ Below we assume you are already in the `agent` directory.
       CUDA_VISIBLE_DEVICES=0 vllm serve rl-research/DR-Tulu-8B --port 30001 --dtype auto --max-model-len 40960
       ```
 
+## Repro: serve GLM-4.7 on vLLM (native tool calling)
+
+This repo uses **uv** for reproducible Python environments:
+- **Lockfile**: `uv.lock`
+- **Virtualenv**: `./.venv` (created/managed by uv)
+- **Deps**: `pyproject.toml`
+
+### 1) Install deps
+
+```bash
+cd agent
+uv pip install -e '.[dev]'
+```
+
+### 2) Launch vLLM for GLM-4.7-FP8 (8×GPU, TP=8)
+
+```bash
+cd agent
+./scripts/serve_glm47_vllm.sh
+```
+
+This launches an OpenAI-compatible server on `http://127.0.0.1:30002/v1` by default.
+
+### 3) Run the key integration tests
+
+```bash
+cd agent
+
+# Minimal chat completion smoke test
+GLM47_BASE_URL=http://127.0.0.1:30002/v1 \
+GLM47_MODEL_NAME='zai-org/GLM-4.7-FP8' \
+uv run pytest -q tests/test_provider_setup_smoke.py::test_glm47_chat_completion_if_configured -q
+
+# Native tool-calling integration test (OpenAI tools/tool_calls loop)
+GLM47_BASE_URL=http://127.0.0.1:30002/v1 \
+GLM47_MODEL_NAME='zai-org/GLM-4.7-FP8' \
+VLLM_NATIVE_TOOLS=1 \
+uv run pytest -q tests/test_vllm_native_tool_use_integration.py::test_vllm_models_use_native_tools_to_answer_simple_question -q
+```
+
+## ScholarQA-CSv2 run + GPT-4.1-mini judge
+
+This repo supports running ScholarQA-CSv2 from a local JSONL/JSON file and judging with GPT-4.1-mini.
+
+### Required env
+
+- `SCHOLARQA_CS2_PATH`: path to your ScholarQA-CSv2 JSONL/JSON file
+- `GLM47_BASE_URL`: your vLLM OpenAI endpoint (e.g. `http://127.0.0.1:30002/v1`)
+- `GLM47_MODEL_NAME`: served model name (e.g. `zai-org/GLM-4.7-FP8`)
+- `OPENAI_API_KEY`: for GPT-4.1-mini judging
+
+### One-command run
+
+```bash
+cd agent
+export SCHOLARQA_CS2_PATH=/path/to/scholarqa_cs2.jsonl
+export GLM47_BASE_URL=http://127.0.0.1:30002/v1
+export GLM47_MODEL_NAME=zai-org/GLM-4.7-FP8
+export OPENAI_API_KEY=...
+
+./scripts/run_scholarqa_cs2_glm47_and_judge.sh
+```
+
+
 
 > [!NOTE]
 > If you run crawl4ai locally, you will need to install playwright and its dependencies.

@@ -1,0 +1,39 @@
+tool_parser: "v20250824"
+
+# Search agent (gpt-oss via OpenAI-compatible API)
+# - Set GPT_OSS_BASE_URL to your server, e.g. http://localhost:30001/v1
+# - Set GPT_OSS_MODEL_NAME to whatever your server exposes. If you serve with vLLM and
+#   pass the HF repo ID as the model path, the served model name usually matches it.
+# - Set GPT_OSS_API_KEY if your server requires it (otherwise it can be any string)
+search_agent_base_url: ${oc.env:GPT_OSS_BASE_URL,"http://127.0.0.1:30001/v1"}
+search_agent_model_name: ${oc.env:GPT_OSS_MODEL_NAME,"openai/gpt-oss-120b"}
+search_agent_api_key: ${oc.env:GPT_OSS_API_KEY,"dummy-key"}
+search_agent_max_tokens: ${oc.env:GPT_OSS_MAX_TOKENS,32000}
+search_agent_temperature: 1.0
+search_agent_max_tool_calls: ${oc.env:GPT_OSS_MAX_TOOL_CALLS,10}
+# Allow choosing tool calling mode for OSS servers (native tools vs parser tags).
+search_agent_tool_calling_mode: ${oc.env:GPT_OSS_TOOL_CALLING_MODE,"native"}
+search_agent_force_first_tool: ${oc.env:GPT_OSS_FORCE_FIRST_TOOL,"snippet_search"}
+
+# Browse/reader agent (optional)
+use_browse_agent: false
+browse_agent_base_url: ${oc.env:GPT_OSS_BROWSE_BASE_URL,"http://127.0.0.1:30001/v1"}
+browse_agent_model_name: ${oc.env:GPT_OSS_BROWSE_MODEL_NAME,"openai/gpt-oss-120b"}
+browse_agent_api_key: ${oc.env:GPT_OSS_BROWSE_API_KEY,"dummy-key"}
+browse_agent_max_tokens: ${oc.env:GPT_OSS_BROWSE_MAX_TOKENS,32000}
+browse_agent_temperature: 0.3
+
+# Search tool configuration
+# NOTE: tool latency dominates runtime; keep these small for throughput.
+search_tool_name: ${oc.env:GPT_OSS_SEARCH_TOOL,"serper"}
+number_documents_to_search: ${oc.env:GPT_OSS_NUM_DOCS,5}
+search_timeout: ${oc.env:GPT_OSS_SEARCH_TIMEOUT,30}
+
+# Browse tool configuration
+browse_tool_name: ${oc.env:GPT_OSS_BROWSE_TOOL,"jina"}
+browse_timeout: ${oc.env:GPT_OSS_BROWSE_TIMEOUT,30}
+# Throughput knobs: browsing is usually the slowest tool.
+browse_max_pages_to_fetch: ${oc.env:GPT_OSS_BROWSE_MAX_PAGES,3}
+browse_context_char_length: ${oc.env:GPT_OSS_BROWSE_CONTEXT_CHARS,3000}
+
+

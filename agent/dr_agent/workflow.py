@@ -558,6 +558,7 @@ class BaseWorkflow(ABC):
         output_file: Optional[Union[str, "Path"]] = None,
         include_original_data: bool = True,
         keep_instance_ids: Optional[Set[str]] = None,
+        receiver_consumer: bool = True,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
@@ -625,72 +626,176 @@ class BaseWorkflow(ABC):
             f"Removing {dataset_keys - call_params} fields."
         )
 
-        # Process in batches
+        # Process in batches (legacy) OR receiver/consumer streaming (recommended).
         output_path = Path(output_file) if output_file else None
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        all_results = []
-        for i in range(0, len(remaining_dataset), batch_size):
-            batch = remaining_dataset[i : i + batch_size]
-            batch_to_process = [
-                {k: v for k, v in item.items() if k in call_params} for item in batch
-            ]
+        # Filter out worker-specific parameters before passing to workflow
+        workflow_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ["num_total_workers", "worker_index"]
+        }
 
-            self.logger.info(
-                f"Processing batch {i//batch_size + 1}/{(len(remaining_dataset) + batch_size - 1)//batch_size}"
-            )
+        all_results: List[Dict[str, Any]] = []
+        output_messages_schema = str(os.environ.get("DR_OUTPUT_MESSAGES_SCHEMA", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
 
-            try:
-                # Filter out worker-specific parameters before passing to workflow
-                workflow_kwargs = {
-                    k: v
-                    for k, v in kwargs.items()
-                    if k not in ["num_total_workers", "worker_index"]
-                }
+        if receiver_consumer:
+            # Receiver/consumer: a work queue of examples + N workers executing __call__,
+            # and a single consumer that writes results as soon as they finish.
+            max_workers = int(max_concurrent_tasks or 1)
+            work_q: asyncio.Queue = asyncio.Queue()
+            result_q: asyncio.Queue = asyncio.Queue()
 
-                # Process batch
-                batch_results = await self.map(
-                    batch_to_process,
-                    max_concurrent_tasks=max_concurrent_tasks,
-                    progress_desc=f"Batch {i//batch_size + 1}",
-                    **workflow_kwargs,
-                )
+            for ex in remaining_dataset:
+                work_q.put_nowait(ex)
+            for _ in range(max_workers):
+                work_q.put_nowait(None)  # sentinel
 
-                # Format batch results
-                formatted_results = []
-                for example, result in zip(batch, batch_results):
-                    result = result.copy()
-                    final_response = result.pop("final_response")
-                    full_traces = result.pop("full_traces")
+            async def _worker(worker_id: int) -> None:
+                while True:
+                    ex = await work_q.get()
+                    try:
+                        if ex is None:
+                            return
+                        item_kwargs = {k: v for k, v in ex.items() if k in call_params}
+                        res = await self.__call__(**{**workflow_kwargs, **item_kwargs})
+                        await result_q.put((ex, res, None))
+                    except Exception as e:
+                        await result_q.put((ex, None, e))
+                    finally:
+                        work_q.task_done()
 
+            workers = [asyncio.create_task(_worker(i)) for i in range(max_workers)]
+
+            # Consume exactly one result per example.
+            for _ in tqdm(range(len(remaining_dataset)), desc="Generating (rc)"):
+                ex, res, err = await result_q.get()
+
+                if err is not None or res is None:
+                    self.logger.error(f"Error processing example_id={getattr(ex, 'id', None) or ex.get('id')}: {err}")
                     eval_output = {
-                        "example_id": example["id"],
-                        "problem": example["problem"],
-                        "final_response": final_response,
-                        "full_traces": full_traces.model_dump(),
+                        "example_id": ex["id"],
+                        "problem": ex.get("problem", ""),
+                        "final_response": "",
+                        "full_traces": {"error": str(err)},
+                        "additional_output_data": {"error": str(err)},
                     }
-
-                    if len(result):
-                        eval_output["additional_output_data"] = result
-
                     if include_original_data:
-                        eval_output["original_data"] = example
+                        eval_output["original_data"] = ex
+                else:
+                    res = res.copy()
+                    final_response = res.pop("final_response")
+                    full_traces = res.pop("full_traces")
 
-                    formatted_results.append(eval_output)
+                    if output_messages_schema:
+                        ft_dump = (
+                            full_traces.model_dump()
+                            if hasattr(full_traces, "model_dump")
+                            else dict(full_traces or {})
+                        )
+                        model_input = ft_dump.get("model_input") or {}
+                        messages = model_input.get("messages")
+                        eval_output = {
+                            "example_id": ex["id"],
+                            "problem": ex["problem"],
+                            "messages": messages if isinstance(messages, list) else [],
+                        }
+                    else:
+                        eval_output = {
+                            "example_id": ex["id"],
+                            "problem": ex["problem"],
+                            "final_response": final_response,
+                            "full_traces": full_traces.model_dump(),
+                        }
+                    if len(res):
+                        eval_output["additional_output_data"] = res
+                    if include_original_data:
+                        eval_output["original_data"] = ex
 
-                all_results.extend(formatted_results)
-
-                # Append batch to file
+                all_results.append(eval_output)
                 if output_path:
                     with open(output_path, "a") as f:
-                        for result in formatted_results:
-                            f.write(json.dumps(result) + "\n")
+                        f.write(json.dumps(eval_output) + "\n")
 
-            except Exception as e:
-                self.logger.error(
-                    f"Error processing batch {i//batch_size + 1}: {e}. Continuing with next batch."
+            # Ensure workers exit.
+            await work_q.join()
+            for w in workers:
+                if not w.done():
+                    w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        else:
+            # Legacy batching (kept for backwards compatibility)
+            for i in range(0, len(remaining_dataset), batch_size):
+                batch = remaining_dataset[i : i + batch_size]
+                batch_to_process = [
+                    {k: v for k, v in item.items() if k in call_params} for item in batch
+                ]
+
+                self.logger.info(
+                    f"Processing batch {i//batch_size + 1}/{(len(remaining_dataset) + batch_size - 1)//batch_size}"
                 )
+
+                try:
+                    batch_results = await self.map(
+                        batch_to_process,
+                        max_concurrent_tasks=max_concurrent_tasks,
+                        progress_desc=f"Batch {i//batch_size + 1}",
+                        **workflow_kwargs,
+                    )
+
+                    formatted_results = []
+                    for example, result in zip(batch, batch_results):
+                        result = result.copy()
+                        final_response = result.pop("final_response")
+                        full_traces = result.pop("full_traces")
+
+                        if output_messages_schema:
+                            ft_dump = (
+                                full_traces.model_dump()
+                                if hasattr(full_traces, "model_dump")
+                                else dict(full_traces or {})
+                            )
+                            model_input = ft_dump.get("model_input") or {}
+                            messages = model_input.get("messages")
+                            eval_output = {
+                                "example_id": example["id"],
+                                "problem": example["problem"],
+                                "messages": messages if isinstance(messages, list) else [],
+                            }
+                        else:
+                            eval_output = {
+                                "example_id": example["id"],
+                                "problem": example["problem"],
+                                "final_response": final_response,
+                                "full_traces": full_traces.model_dump(),
+                            }
+
+                        if len(result):
+                            eval_output["additional_output_data"] = result
+
+                        if include_original_data:
+                            eval_output["original_data"] = example
+
+                        formatted_results.append(eval_output)
+
+                    all_results.extend(formatted_results)
+
+                    if output_path:
+                        with open(output_path, "a") as f:
+                            for result in formatted_results:
+                                f.write(json.dumps(result) + "\n")
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Error processing batch {i//batch_size + 1}: {e}. Continuing with next batch."
+                    )
 
         # Sort final file by original dataset order if output file was provided
         if output_path and os.path.exists(output_path):

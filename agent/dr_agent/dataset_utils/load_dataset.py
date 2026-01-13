@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import os
 import random
 import tempfile
 import urllib.request
@@ -120,6 +121,20 @@ def load_dataset(config: DatasetConfig) -> List[Dict]:
             "num_examples must be an integer or 'ablation', 'final_run', or 'final_run_100'"
         )
 
+    if config["name"] in ["scholarqa_cs2", "scholarqa-cs2"]:
+        # ScholarQA-CS2 is not bundled as a fixed HF dataset in this repo yet.
+        # We support loading it from a local JSON/JSONL file for reproducibility.
+        # Optional: deterministic shuffle for partial runs (e.g., do first 25 now, resume later)
+        # Enable via env var SCHOLARQA_CS2_SHUFFLE=1.
+        if str(os.environ.get("SCHOLARQA_CS2_SHUFFLE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            shuffle = True
+        return load_scholarqa_cs2_data(num_examples, shuffle, local_path)
     if config["name"] == "browsecomp":
         return load_browsecomp_data(num_examples, shuffle, local_path)
     elif config["name"] == "simpleqa":
@@ -146,6 +161,287 @@ def load_dataset(config: DatasetConfig) -> List[Dict]:
         raise ValueError(
             f"Unsupported dataset: {config['name']}. Supported datasets: {list(SUPPORTED_TASKS.keys())}, browsecomp, simpleqa, healthbench, researchqa, deep_research_bench"
         )
+
+
+def load_scholarqa_cs2_data(
+    num_examples: Optional[int] = None,
+    shuffle: bool = False,
+    local_path: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Load ScholarQA-CS2 from a local JSON/JSONL file, or (optionally) from HF.
+
+    Expected record shape (flexible):
+      - question / problem / query: str
+      - id / qid / case_id: optional str (falls back to md5(question))
+
+    Args:
+        num_examples: Limit to first N examples (optional)
+        shuffle: Whether to shuffle the examples
+        local_path: Path to a JSON/JSONL file. If not provided, uses SCHOLARQA_CS2_PATH env var.
+    """
+    path = local_path or os.environ.get("SCHOLARQA_CS2_PATH")
+    if not path:
+        # HF fallback (useful for AstaBench-hosted variants).
+        return _load_scholarqa_cs2_from_hf(num_examples=num_examples, shuffle=shuffle)
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"ScholarQA-CS2 local_path not found: {p}")
+
+    records: List[Dict] = []
+    if p.suffix.lower() == ".jsonl":
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+    elif p.suffix.lower() == ".json":
+        with p.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            records = loaded
+        elif isinstance(loaded, dict) and "data" in loaded and isinstance(loaded["data"], list):
+            records = loaded["data"]
+        else:
+            raise ValueError(
+                f"Unsupported ScholarQA-CS2 JSON structure in {p}. Expected a list or {{'data': list}}."
+            )
+    else:
+        raise ValueError(f"Unsupported ScholarQA-CS2 file type: {p.suffix} (expected .jsonl or .json)")
+
+    examples: List[Dict] = []
+    for rec in records:
+        question = (
+            rec.get("question")
+            or rec.get("problem")
+            or rec.get("query")
+            or rec.get("prompt")
+        )
+        if not isinstance(question, str) or not question.strip():
+            # Skip malformed rows rather than crashing an entire run
+            continue
+        question = question.strip()
+
+        ex_id = rec.get("id") or rec.get("qid") or rec.get("case_id")
+        if not isinstance(ex_id, str) or not ex_id.strip():
+            ex_id = hashlib.md5(question.encode()).hexdigest()
+
+        examples.append(
+            {
+                "id": ex_id,
+                "problem": question,
+                "additional_instructions": "Please write a well structured, data-driven report on the given research question, and add citations when needed.",
+            }
+        )
+
+    if shuffle:
+        random.seed(42)
+        random.shuffle(examples)
+
+    if num_examples:
+        examples = examples[:num_examples]
+
+    return examples
+
+
+def _get_hf_token() -> Optional[str]:
+    """
+    Best-effort Hugging Face token discovery.
+
+    `datasets`/`huggingface_hub` will also look in the local HF cache if the user has logged in,
+    but for gated datasets it's often easiest to provide a token explicitly via env vars.
+    """
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HF_KEY2")
+        or os.environ.get("HF_KEY")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HF_HUB_TOKEN")
+    )
+
+
+def _pick_split_from_datasetdict(dd: "datasets.DatasetDict") -> str:
+    # Prefer eval splits when present.
+    for s in ("test", "validation", "val", "dev", "train"):
+        if s in dd:
+            return s
+    # Fall back to the first split key deterministically.
+    return sorted(dd.keys())[0]
+
+
+def _load_scholarqa_cs2_from_hf(
+    num_examples: Optional[int] = None,
+    shuffle: bool = False,
+) -> List[Dict]:
+    """
+    Load ScholarQA-CS2-like tasks from Hugging Face.
+
+    This is primarily intended for AstaBench-hosted tasks, e.g. `allenai/asta-bench`.
+
+    Env vars:
+      - SCHOLARQA_CS2_HF_DATASET (default: allenai/asta-bench)
+      - SCHOLARQA_CS2_HF_CONFIG (required for most multi-config datasets; otherwise we try to infer)
+      - SCHOLARQA_CS2_HF_SPLIT (optional; otherwise we pick test/validation/train)
+      - HF_TOKEN / HUGGINGFACE_HUB_TOKEN (required for gated datasets)
+    """
+    hf_dataset = os.environ.get("SCHOLARQA_CS2_HF_DATASET", "allenai/asta-bench")
+    hf_config = os.environ.get("SCHOLARQA_CS2_HF_CONFIG")
+    hf_split = os.environ.get("SCHOLARQA_CS2_HF_SPLIT")
+    token = _get_hf_token()
+
+    # Many benchmark repos (including AstaBench) are gated; surface a clear error if no token.
+    if token is None:
+        raise ValueError(
+            "ScholarQA-CS2 HF loading requires a Hugging Face token for gated datasets. "
+            "Set HF_TOKEN (or HUGGINGFACE_HUB_TOKEN) and (usually) SCHOLARQA_CS2_HF_CONFIG. "
+            "Alternatively, set SCHOLARQA_CS2_PATH to a local JSONL/JSON file."
+        )
+
+    # If no config provided, try to infer it from the available config names.
+    if not hf_config:
+        try:
+            cfgs = datasets.get_dataset_config_names(hf_dataset, token=token)
+        except Exception as e:
+            raise ValueError(
+                f"Could not list configs for {hf_dataset!r} (likely gated or missing access). "
+                "Set SCHOLARQA_CS2_HF_CONFIG explicitly once you know the correct key. "
+                f"Original error: {type(e).__name__}: {e}"
+            ) from e
+
+        # Heuristic matching: prefer scholarqa cs2/v2 variants.
+        preferred_substrings = [
+            "scholarqa_cs2",
+            "scholarqa-cs2",
+            "scholarqa_cs_v2",
+            "scholarqa_cs_v2",
+            "scholarqa_csv2",
+            "scholarqa_cs",
+        ]
+        cfg_lower = [(c.lower(), c) for c in cfgs]
+        chosen = None
+        for needle in preferred_substrings:
+            for lo, orig in cfg_lower:
+                if needle in lo:
+                    chosen = orig
+                    break
+            if chosen:
+                break
+
+        if not chosen:
+            # As a last resort, if the dataset only has one config, use it.
+            if len(cfgs) == 1:
+                chosen = cfgs[0]
+            else:
+                raise ValueError(
+                    f"Could not infer SCHOLARQA-CS2 config from {hf_dataset!r}. "
+                    f"Available configs (first 50): {cfgs[:50]}. "
+                    "Set SCHOLARQA_CS2_HF_CONFIG explicitly."
+                )
+        hf_config = chosen
+
+    # Load dataset (split-aware). Some gated benchmark repos are not loadable via `datasets`
+    # in older/pinned versions, but the files can still be fetched via `huggingface_hub`.
+    hf_ds = None
+    try:
+        if hf_split:
+            hf_ds = datasets.load_dataset(hf_dataset, hf_config, split=hf_split, token=token)
+        else:
+            dd = datasets.load_dataset(hf_dataset, hf_config, token=token)
+            if isinstance(dd, datasets.DatasetDict):
+                hf_split = _pick_split_from_datasetdict(dd)
+                hf_ds = dd[hf_split]
+            else:
+                hf_ds = dd
+    except Exception:
+        hf_ds = None
+
+    if hf_ds is None:
+        # Hub-file fallback: treat hf_config as a relative path under the dataset repo.
+        # For example, AstaBench SQA uses `tasks/sqa/rubrics_v2_recomputed.json`.
+        try:
+            from huggingface_hub import hf_hub_download
+        except Exception as e:  # pragma: no cover
+            raise ValueError(
+                "Could not import huggingface_hub for HF dataset fallback loading. "
+                f"Original error: {type(e).__name__}: {e}"
+            ) from e
+
+        try:
+            path = hf_hub_download(
+                repo_id=hf_dataset,
+                repo_type="dataset",
+                filename=hf_config,
+                token=token,
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load HF dataset={hf_dataset!r} via both `datasets` and hub-file fallback. "
+                f"Tried config/path={hf_config!r}. "
+                f"Original error: {type(e).__name__}: {e}"
+            ) from e
+
+        # Parse JSON/JSONL into a list[dict]
+        p = Path(path)
+        records: List[Dict[str, Any]] = []
+        if p.suffix.lower() == ".jsonl":
+            with p.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    records.append(json.loads(line))
+        else:
+            with p.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                records = loaded
+            elif isinstance(loaded, dict) and "data" in loaded and isinstance(loaded["data"], list):
+                records = loaded["data"]
+            else:
+                raise ValueError(
+                    f"Unsupported HF JSON structure in {p}. Expected a list or {{'data': list}}."
+                )
+
+        hf_ds = records
+
+    # Normalize to our expected example shape.
+    examples: List[Dict] = []
+    for rec in hf_ds:
+        if not isinstance(rec, dict):
+            continue
+        question = (
+            rec.get("question")
+            or rec.get("problem")
+            or rec.get("query")
+            or rec.get("prompt")
+            or rec.get("input")
+        )
+        if not isinstance(question, str) or not question.strip():
+            continue
+        question = question.strip()
+
+        ex_id = rec.get("id") or rec.get("qid") or rec.get("case_id") or rec.get("example_id")
+        if not isinstance(ex_id, str) or not ex_id.strip():
+            ex_id = hashlib.md5(question.encode()).hexdigest()
+
+        examples.append(
+            {
+                "id": ex_id,
+                "problem": question,
+                "additional_instructions": "Please write a well structured, data-driven report on the given research question, and add citations when needed.",
+            }
+        )
+
+    if shuffle:
+        random.seed(42)
+        random.shuffle(examples)
+
+    if num_examples:
+        examples = examples[:num_examples]
+
+    return examples
 
 
 def load_browsecomp_data(

@@ -198,6 +198,7 @@ class BaseAgent:
             "generation_prefix",
             "stop",
             "tool_calling_mode",  # Support for native vs parser tool calling
+            "tool_choice",  # Allow forcing a specific tool call (useful for integration tests)
             "on_step_callback", # Added callback
         }
 

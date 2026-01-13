@@ -103,8 +103,12 @@ class Document(BaseModel):
                 if success:
                     localized_snippet = localized_content
                 else:
-                    # Fallback to original snippet if localization fails
-                    localized_snippet = self.snippet
+                    # If localization fails, fall back to the beginning of the webpage content
+                    # (this is typically more informative than the original search snippet).
+                    truncated_content = self.text[:context_chars].strip()
+                    if len(self.text) > context_chars:
+                        truncated_content += "..."
+                    localized_snippet = truncated_content
             elif self.snippet and not use_localized_snippets:
                 # Use original snippet without localization
                 localized_snippet = self.snippet

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import uuid
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from urllib.parse import parse_qs
 
 import litellm
 from litellm.utils import token_counter
@@ -33,6 +35,7 @@ except ImportError:
 from .tool_interface.base import BaseTool
 from .tool_interface.data_types import DocumentToolOutput, ToolInput, ToolOutput
 from .tool_interface.tool_parsers import ToolCallInfo
+from .tool_interface.executor import AsyncToolExecutor, ToolRequest
 
 # Context variable to store the current client
 _llm_tool_client_context: ContextVar[Optional["LLMToolClient"]] = ContextVar(
@@ -50,6 +53,9 @@ class GenerateWithToolsOutput(BaseModel):
     tool_call_count: int
     stopped_reason: str
     tool_calls: List[Union[ToolOutput, DocumentToolOutput]]
+    # Debug-only: capture the exact messages/prompt that were sent to the model.
+    # This can be large; enable via DR_TRACE_MODEL_INPUT=1
+    model_input: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -70,6 +76,123 @@ class GenerationConfig:
 
 
 class LLMToolClient:
+    def _recover_tool_calls_from_content(self, content: str) -> List[Dict[str, Any]]:
+        """
+        Recover tool calls from assistant text for models/servers that do not populate
+        OpenAI-style message.tool_calls but still emit tool call markers in content.
+
+        Known observed pattern (GLM-style):
+          <tool_call>tool_name?arg1=val&arg2=val</think>
+
+        Returns OpenAI-style tool_call dicts:
+          {"id": "...", "type": "function", "function": {"name": "...", "arguments": "{...json...}"}}
+        """
+        if not content:
+            return []
+
+        recovered: List[Dict[str, Any]] = []
+
+        def _mk(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "id": f"recovered_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            }
+
+        # 1) Prefer well-formed blocks: <tool_call> ... </tool_call>
+        for m in re.finditer(
+            r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", content, flags=re.IGNORECASE
+        ):
+            inner = m.group(1)
+            inner = re.sub(r"</?think>", "", inner, flags=re.IGNORECASE).strip()
+            recovered.extend(self._recover_tool_calls_from_compact(inner, _mk))
+            recovered.extend(self._recover_tool_calls_from_arg_tags(inner, _mk))
+
+        # 2) Handle common malformed pattern: <tool_call>... (no closing tag)
+        # Capture up to the next '<' (e.g., before </think>) or end of string.
+        for m in re.finditer(r"<tool_call>\s*([^<\n]+)", content, flags=re.IGNORECASE):
+            inner = m.group(1)
+            inner = re.sub(r"</?think>", "", inner, flags=re.IGNORECASE).strip()
+            recovered.extend(self._recover_tool_calls_from_compact(inner, _mk))
+            recovered.extend(self._recover_tool_calls_from_arg_tags(inner, _mk))
+
+        # De-dupe identical recovered calls (best-effort) while preserving order
+        seen = set()
+        out: List[Dict[str, Any]] = []
+        for c in recovered:
+            key = (c.get("function", {}).get("name"), c.get("function", {}).get("arguments"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+        return out
+
+    def _recover_tool_calls_from_compact(
+        self, compact: str, mk: Callable[[str, Dict[str, Any]], Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse a compact tool call encoding like:
+          tool_name?arg1=val&arg2=val
+        """
+        if not compact:
+            return []
+
+        # Drop any trailing thought markers if present.
+        compact = compact.strip().strip('"').strip()
+
+        # tool?querystring
+        if "?" in compact:
+            name, qs = compact.split("?", 1)
+            name = name.strip()
+            qs = qs.strip()
+            if not name:
+                return []
+            parsed = parse_qs(qs, keep_blank_values=True)
+            args: Dict[str, Any] = {k: (v[-1] if isinstance(v, list) and v else "") for k, v in parsed.items()}
+            return [mk(name, args)]
+
+        # If it's just a name with no args, still return an empty-args call.
+        if re.fullmatch(r"[A-Za-z0-9_\-]+", compact):
+            return [mk(compact, {})]
+
+        return []
+
+    def _recover_tool_calls_from_arg_tags(
+        self, inner: str, mk: Callable[[str, Dict[str, Any]], Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse GLM-style tool call encoding like:
+          get_secret_code<arg_key>key</arg_key><arg_value>alpha</arg_value>
+
+        Some vLLM+GLM setups emit this inside <tool_call>...</tool_call> but do not populate
+        OpenAI `tool_calls`.
+        """
+        if not inner:
+            return []
+
+        # Extract tool name: prefix before the first tag.
+        name = inner.split("<", 1)[0].strip()
+        if not name:
+            return []
+
+        # Extract key/value pairs.
+        keys = re.findall(r"<arg_key>\s*([\s\S]*?)\s*</arg_key>", inner, flags=re.IGNORECASE)
+        vals = re.findall(r"<arg_value>\s*([\s\S]*?)\s*</arg_value>", inner, flags=re.IGNORECASE)
+        if not keys or not vals:
+            return []
+
+        args: Dict[str, Any] = {}
+        for k, v in zip(keys, vals):
+            k = (k or "").strip()
+            v = (v or "").strip()
+            if not k:
+                continue
+            args[k] = v
+
+        if not args:
+            return []
+
+        return [mk(name, args)]
     """LLM Client with integrated tool calling"""
 
     # Global semaphore for controlling concurrent generation calls
@@ -103,6 +226,14 @@ class LLMToolClient:
         self.client = client  # For custom client if provided
 
         self.tools = tools or []
+        # High-concurrency tool execution (no internal rate limiting).
+        self._tool_executor = AsyncToolExecutor(
+            enable_cache=os.environ.get("TOOL_EXECUTOR_CACHE", "1").lower()
+            in ("1", "true", "yes"),
+            enable_inflight_dedupe=os.environ.get("TOOL_EXECUTOR_INFLIGHT_DEDUPE", "1")
+            .lower()
+            in ("1", "true", "yes"),
+        )
         self.model_name = model_name
         self.generation_config = generation_config or GenerationConfig()
 
@@ -192,6 +323,16 @@ class LLMToolClient:
 
         return any(pattern in model_lower for pattern in all_commercial_patterns)
 
+    def _supports_openai_style_tool_calling(self) -> bool:
+        """
+        Whether we can use OpenAI-style native tool calling (tools/tool_calls) for this client.
+
+        This is true for:
+        - Commercial API models handled via LiteLLM (OpenAI/Claude/etc.)
+        - Self-hosted models behind an OpenAI-compatible API (e.g., vLLM / TGI) when base_url is provided
+        """
+        return bool(self.base_url) or self._is_commercial_api_model(self.model_name)
+
     def add_tool(self, tool: BaseTool):
         """Add a tool to the client"""
         # Validate parser type consistency if we already have tools
@@ -225,6 +366,45 @@ class LLMToolClient:
             if tool.has_calls(text):
                 return tool
         return None
+
+    def _extract_all_tool_calls_from_text(
+        self, text: str
+    ) -> List[Tuple[BaseTool, ToolCallInfo, str]]:
+        """
+        Extract ALL tool calls in left-to-right order from `text`.
+
+        This is used for parser-mode + vLLM/text-mode tool calling, where models may emit
+        multiple tool calls in a single assistant chunk.
+        """
+        results: List[Tuple[BaseTool, ToolCallInfo, str]] = []
+        cursor = 0
+        while cursor < len(text):
+            remaining = text[cursor:]
+            best_tool: Optional[BaseTool] = None
+            best_info: Optional[ToolCallInfo] = None
+            best_abs_start: Optional[int] = None
+            best_abs_end: Optional[int] = None
+
+            for tool in self.tools:
+                info = tool.parse_call(remaining)
+                if info is None:
+                    continue
+                abs_start = cursor + info.start_pos
+                abs_end = cursor + info.end_pos
+                if best_abs_start is None or abs_start < best_abs_start:
+                    best_tool = tool
+                    best_info = info
+                    best_abs_start = abs_start
+                    best_abs_end = abs_end
+
+            if best_tool is None or best_info is None:
+                break
+
+            call_text = text[best_abs_start:best_abs_end]
+            results.append((best_tool, best_info, call_text))
+            cursor = best_abs_end
+
+        return results
 
     def _count_tokens(self, text: str) -> int:
         """Count the number of tokens in the given text"""
@@ -280,10 +460,16 @@ class LLMToolClient:
     ) -> int:
         """Calculate remaining max tokens based on current messages length for commercial API models"""
         current_token_count = self._count_tokens_messages(current_messages)
-        remaining_tokens = base_max_tokens - current_token_count
+        # IMPORTANT:
+        # - For OpenAI-compatible chat APIs, `max_tokens` is a COMPLETION budget, but the provider
+        #   enforces a TOTAL context limit (prompt + completion <= context_length).
+        # - Token counting can differ between LiteLLM/token_counter and the server-side tokenizer.
+        #   Apply a safety buffer so we don't exceed the provider's context window.
+        safety_buffer = int(os.environ.get("DR_TOKEN_SAFETY_BUFFER", "512"))
+        remaining_tokens = base_max_tokens - current_token_count - safety_buffer
 
-        # Ensure we have at least some tokens for generation (minimum 100)
-        return max(100, remaining_tokens)
+        # Ensure we have at least some tokens for generation (minimum 64)
+        return max(64, remaining_tokens)
 
     def _messages_to_prompt(self, messages: List[Dict[str, str]]) -> str:
         """Convert messages to a single prompt string using tokenizer chat template"""
@@ -539,31 +725,29 @@ class LLMToolClient:
                     )
                 break
 
-            # Check for tool calls
-            if generation_prefix and iteration == 1:
-                tool_match = self._find_first_tool_call(
-                    generation_prefix + response_content
-                )
-            else:
-                tool_match = self._find_first_tool_call(response_content)
+            # Check for tool calls (extract ALL tool calls in the chunk)
+            tool_parse_text = (
+                generation_prefix + response_content
+                if (generation_prefix and iteration == 1)
+                else response_content
+            )
+            extracted_calls = self._extract_all_tool_calls_from_text(tool_parse_text)
 
-            if not tool_match:
+            if not extracted_calls:
                 # No tool calls found, we're done
                 if verbose:
                     print("No tool calls found, finishing.")
                 break
 
-            tool = tool_match
-
             # Check if we've exceeded the maximum number of tool calls
-            if tool_call_count >= max_tool_calls:
+            if tool_call_count + len(extracted_calls) > max_tool_calls:
                 if verbose:
                     print(
                         f"Exceeded maximum tool calls ({max_tool_calls}), creating error output."
                     )
 
-                # Create error output for exceeding tool call limit
-                error_output = tool._create_error_output(
+                tool0 = extracted_calls[0][0]
+                error_output = tool0._create_error_output(
                     error_msg="Exceed allowed tool call requests",
                     call_id="",
                     runtime=0,
@@ -571,28 +755,43 @@ class LLMToolClient:
                 )
                 tool_calls.append(error_output)
 
-                # Optionally append the error to the context
                 if include_tool_results:
-                    error_formatted = tool.format_result(error_output)
-                    current_messages.append(
-                        {"role": "user", "content": error_formatted}
-                    )
+                    error_formatted = tool0.format_result(error_output)
+                    current_messages.append({"role": "user", "content": error_formatted})
                 break
 
             if verbose:
-                print(f"Found tool call: {tool.name}")
+                tool_names = [t.name for (t, _, _) in extracted_calls]
+                print(f"Found {len(extracted_calls)} tool call(s): {tool_names}")
 
-            # Execute the tool
-            if generation_prefix and iteration == 1:
-                tool_output = await tool(generation_prefix + response_content)
-            else:
-                tool_output = await tool(response_content)
-            tool_call_count += 1
+            # Execute all tools concurrently via the shared executor
+            reqs = [
+                ToolRequest(tool=tool, tool_input=call_text, call_info=call_info)
+                for (tool, call_info, call_text) in extracted_calls
+            ]
+            tool_outputs = await asyncio.gather(
+                *(self._tool_executor.execute(r) for r in reqs), return_exceptions=True
+            )
 
-            # Record the tool call
-            tool_calls.append(tool_output)
+            realized_outputs: List[ToolOutput] = []
+            for (tool, _call_info, _call_text), tool_output in zip(
+                extracted_calls, tool_outputs
+            ):
+                if isinstance(tool_output, Exception):
+                    realized_outputs.append(
+                        tool._create_error_output(
+                            error_msg=str(tool_output),
+                            call_id="",
+                            runtime=0,
+                            output=f"Error executing tool: {str(tool_output)}",
+                        )
+                    )
+                else:
+                    realized_outputs.append(tool_output)
 
-            # Call on_step_callback with the tool output
+            tool_call_count += len(realized_outputs)
+            tool_calls.extend(realized_outputs)
+
             if on_step_callback:
                 is_async = asyncio.iscoroutinefunction(on_step_callback) or (
                     callable(on_step_callback)
@@ -601,17 +800,21 @@ class LLMToolClient:
                     )
                 )
                 if is_async:
-                    await on_step_callback("", [tool_output])
+                    await on_step_callback("", realized_outputs)
                 else:
-                    on_step_callback("", [tool_output])
+                    on_step_callback("", realized_outputs)
 
-            if include_tool_results and tool_output.called:
-                # Append tool result to context as user message
-                result_formatted = tool.format_result(tool_output)
-                current_messages.append({"role": "user", "content": result_formatted})
-
-                if verbose:
-                    print(f"Tool output: {tool_output.output}")
+            if include_tool_results:
+                for (tool, _call_info, _call_text), out in zip(
+                    extracted_calls, realized_outputs
+                ):
+                    if out.called:
+                        result_formatted = tool.format_result(out)
+                        current_messages.append(
+                            {"role": "user", "content": result_formatted}
+                        )
+                        if verbose:
+                            print(f"Tool '{tool.name}' output: {out.output[:200]}...")
 
             # Check token limit again after adding tool results
             final_token_count = self._count_tokens_messages(current_messages)
@@ -628,6 +831,13 @@ class LLMToolClient:
             generated_text += msg["content"]
 
         final_token_count = self._count_tokens_messages(current_messages)
+        trace_model_input = str(os.environ.get("DR_TRACE_MODEL_INPUT", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         return GenerateWithToolsOutput(
             tool_calls=tool_calls,
             generated_text=generated_text,
@@ -636,6 +846,7 @@ class LLMToolClient:
             stopped_reason=(
                 "max_tokens" if final_token_count >= base_max_tokens else "natural"
             ),
+            model_input=({"messages": current_messages} if trace_model_input else None),
         )
 
     async def _generate_with_tools_vllm(
@@ -734,30 +945,29 @@ class LLMToolClient:
                     )
                 break
 
-            # Check for tool calls
-            # TODO: This part should be refactored to use each tool's find_tool_blocks method
-            if generation_prefix and iteration == 1:
-                tool_match = self._find_first_tool_call(generation_prefix + response)
-            else:
-                tool_match = self._find_first_tool_call(response)
+            # Check for tool calls (extract ALL tool calls in the chunk)
+            tool_parse_text = (
+                generation_prefix + response
+                if (generation_prefix and iteration == 1)
+                else response
+            )
+            extracted_calls = self._extract_all_tool_calls_from_text(tool_parse_text)
 
-            if not tool_match:
+            if not extracted_calls:
                 # No tool calls found, we're done
                 if verbose:
                     print("No tool calls found, finishing.")
                 break
 
-            tool = tool_match
-
             # Check if we've exceeded the maximum number of tool calls
-            if tool_call_count >= max_tool_calls:
+            if tool_call_count + len(extracted_calls) > max_tool_calls:
                 if verbose:
                     print(
                         f"Exceeded maximum tool calls ({max_tool_calls}), creating error output."
                     )
 
-                # Create error output for exceeding tool call limit
-                error_output = tool._create_error_output(
+                tool0 = extracted_calls[0][0]
+                error_output = tool0._create_error_output(
                     error_msg="exceed allowed tool call requests",
                     call_id="",
                     runtime=0,
@@ -766,26 +976,43 @@ class LLMToolClient:
 
                 tool_calls.append(error_output)
 
-                # Optionally append the error to the context
                 if include_tool_results:
-                    error_formatted = tool.format_result(error_output)
+                    error_formatted = tool0.format_result(error_output)
                     current_context += "\n" + error_formatted
 
             else:
                 if verbose:
-                    print(f"Found tool call: {tool.name}")
+                    tool_names = [t.name for (t, _, _) in extracted_calls]
+                    print(f"Found {len(extracted_calls)} tool call(s): {tool_names}")
 
-                # Execute the tool
-                if generation_prefix and iteration == 1:
-                    tool_output = await tool(generation_prefix + response)
-                else:
-                    tool_output = await tool(response)
-                tool_call_count += 1
+                reqs = [
+                    ToolRequest(tool=tool, tool_input=call_text, call_info=call_info)
+                    for (tool, call_info, call_text) in extracted_calls
+                ]
+                tool_outputs = await asyncio.gather(
+                    *(self._tool_executor.execute(r) for r in reqs),
+                    return_exceptions=True,
+                )
 
-                # Record the tool call - just save the ToolOutput directly
-                tool_calls.append(tool_output)
+                realized_outputs: List[ToolOutput] = []
+                for (tool, _call_info, _call_text), tool_output in zip(
+                    extracted_calls, tool_outputs
+                ):
+                    if isinstance(tool_output, Exception):
+                        realized_outputs.append(
+                            tool._create_error_output(
+                                error_msg=str(tool_output),
+                                call_id="",
+                                runtime=0,
+                                output=f"Error executing tool: {str(tool_output)}",
+                            )
+                        )
+                    else:
+                        realized_outputs.append(tool_output)
 
-                # Call on_step_callback with the tool output
+                tool_call_count += len(realized_outputs)
+                tool_calls.extend(realized_outputs)
+
                 if on_step_callback:
                     is_async = asyncio.iscoroutinefunction(on_step_callback) or (
                         callable(on_step_callback)
@@ -794,18 +1021,19 @@ class LLMToolClient:
                         )
                     )
                     if is_async:
-                        await on_step_callback("", [tool_output])
+                        await on_step_callback("", realized_outputs)
                     else:
-                        on_step_callback("", [tool_output])
+                        on_step_callback("", realized_outputs)
 
-                if include_tool_results and tool_output.called:
-                    # Append tool result to context
-                    result_formatted = tool.format_result(tool_output)
-                    current_context += result_formatted
-                    # TODO: maybe we should add a new line after the tool result
-
-                    if verbose:
-                        print(f"Tool output: {tool_output.output}")
+                if include_tool_results:
+                    for (tool, _call_info, _call_text), out in zip(
+                        extracted_calls, realized_outputs
+                    ):
+                        if out.called:
+                            result_formatted = tool.format_result(out)
+                            current_context += result_formatted
+                            if verbose:
+                                print(f"Tool '{tool.name}' output: {out.output[:200]}...")
 
             # Check token limit again after adding tool results
             final_token_count = self._count_tokens(current_context)
@@ -816,6 +1044,13 @@ class LLMToolClient:
                     )
                 break
 
+        trace_model_input = str(os.environ.get("DR_TRACE_MODEL_INPUT", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         return GenerateWithToolsOutput(
             tool_calls=tool_calls,
             generated_text=current_context[len(prompt) :],
@@ -826,6 +1061,7 @@ class LLMToolClient:
                 if self._count_tokens(current_context) >= base_max_tokens
                 else "natural"
             ),
+            model_input=({"prompt": current_context} if trace_model_input else None),
         )
 
     async def _generate_with_tools_native(
@@ -842,11 +1078,13 @@ class LLMToolClient:
     ) -> GenerateWithToolsOutput:
         """Generate response using native OpenAI-style tool calling via litellm"""
 
-        # Validate model supports native tool calling (OpenAI for now)
-        if not self._is_commercial_api_model(self.model_name):
+        # Validate model supports OpenAI-style native tool calling (tools/tool_calls).
+        # This includes commercial APIs and self-hosted OpenAI-compatible endpoints (when base_url is set).
+        if not self._supports_openai_style_tool_calling():
             raise ValueError(
-                f"Native tool calling mode currently only supports commercial API models (OpenAI, Claude, etc.). "
-                f"Model '{self.model_name}' appears to be a self-hosted model. Use tool_calling_mode='parser' instead."
+                "Native tool calling requires an OpenAI-style tools/tool_calls API. "
+                f"Model '{self.model_name}' does not look like a supported commercial model and no base_url was provided. "
+                "Either set base_url to your OpenAI-compatible server or use tool_calling_mode='parser'."
             )
 
         # Convert to messages format if needed
@@ -872,6 +1110,11 @@ class LLMToolClient:
         base_max_tokens = (
             max_tokens if max_tokens is not None else self.generation_config.max_tokens
         )
+
+        # If caller forces a tool_choice, only apply it on the FIRST iteration.
+        # Forcing tool_choice on every iteration can cause infinite tool loops (e.g., vLLM will keep
+        # returning tool_calls even after tool results are provided).
+        forced_tool_choice = kwargs.pop("tool_choice", "auto")
 
         while True:
             iteration += 1
@@ -907,17 +1150,31 @@ class LLMToolClient:
                 max_tokens=dynamic_max_tokens,
                 seed=seed,
                 verbose=verbose,
+                tool_choice=(forced_tool_choice if iteration == 1 else "auto"),
                 **kwargs,
             )
 
             # Extract response message
             response_message = response.choices[0].message
+            # OSS vLLM may return the completion in reasoning_content and leave content empty/None.
+            rm_content = (response_message.content or "") if response_message else ""
+            if not rm_content:
+                rm_content = (
+                    getattr(response_message, "reasoning_content", None)
+                    or (
+                        isinstance(
+                            getattr(response_message, "provider_specific_fields", None), dict
+                        )
+                        and response_message.provider_specific_fields.get("reasoning_content")
+                    )
+                    or ""
+                )
 
             # Append assistant's response to messages (contains tool_calls if any)
             current_messages.append(
                 {
                     "role": "assistant",
-                    "content": response_message.content or "",
+                    "content": rm_content,
                     "tool_calls": getattr(response_message, "tool_calls", None),
                 }
             )
@@ -933,6 +1190,107 @@ class LLMToolClient:
 
             # Check for tool calls
             tool_calls = getattr(response_message, "tool_calls", None)
+
+            # Some OpenAI-compatible servers/models emit tool calls in the assistant content
+            # (e.g., "<tool_call>tool?arg=val</tool_call>") but do not populate tool_calls.
+            # Recover them so GLM-style tool usage still works.
+            if not tool_calls:
+                recovered = self._recover_tool_calls_from_content(
+                    rm_content
+                )
+                if recovered:
+                    tool_calls = recovered
+                    # Update the last assistant message in-place so downstream token counting / logging
+                    # sees the recovered tool calls.
+                    current_messages[-1]["tool_calls"] = tool_calls
+            else:
+                # Normalize tool_calls into JSON-serializable dicts and ensure `function.arguments` is valid JSON.
+                # This matters for some vLLM+GLM setups where tool_choice-forced calls return non-JSON arguments,
+                # and vLLM later fails when parsing the chat history.
+                normalized_calls: List[Dict[str, Any]] = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        call = tc
+                    else:
+                        call = {
+                            "id": getattr(tc, "id", "") or "",
+                            "type": getattr(tc, "type", "function") or "function",
+                            "function": {
+                                "name": getattr(getattr(tc, "function", None), "name", "") or "",
+                                "arguments": getattr(getattr(tc, "function", None), "arguments", "") or "",
+                            },
+                        }
+
+                    fn = call.get("function", {}) or {}
+                    fn_name = (fn.get("name") or "").strip()
+                    arg_str = fn.get("arguments")
+                    arg_str = "" if arg_str is None else str(arg_str)
+
+                    def _coerce_to_json_args(tool_name: str, raw: str) -> str:
+                        raw = (raw or "").strip()
+                        if not raw:
+                            return "{}"
+                        try:
+                            json.loads(raw)
+                            return raw
+                        except Exception:
+                            pass
+
+                        # Try to extract values for required keys from the raw string using the tool schema.
+                        args: Dict[str, Any] = {}
+                        tool = tools_by_name.get(tool_name)
+                        required: List[str] = []
+                        if tool is not None:
+                            try:
+                                schema = tool.to_openai_tool_schema()
+                                required = (
+                                    schema.get("function", {})
+                                    .get("parameters", {})
+                                    .get("required", [])
+                                    or []
+                                )
+                            except Exception:
+                                required = []
+
+                        # Common fallback keys if schema isn't available.
+                        if not required:
+                            required = ["query", "url", "key", "input", "text", "content"]
+
+                        # If the model returned a bare string (e.g., "alpha") and the tool has
+                        # exactly one required field, treat the whole string as the value for that field.
+                        # This is common in some vLLM/OpenAI-compatible servers when tool_choice is forced.
+                        if len(required) == 1 and raw and all(k not in raw for k in [":", "=", "<arg_key>", "<arg_value>"]):
+                            return json.dumps({required[0]: raw.strip().strip('"')}, ensure_ascii=False)
+
+                        for k in required:
+                            # Match patterns like: key 'alpha' / key="alpha" / key: alpha
+                            m = re.findall(
+                                rf"{re.escape(k)}[^A-Za-z0-9]+['\"]([^'\"]+)['\"]",
+                                raw,
+                                flags=re.IGNORECASE,
+                            )
+                            if not m:
+                                m = re.findall(
+                                    rf"{re.escape(k)}\\s*[:=]\\s*([A-Za-z0-9_\\-\\.]+)",
+                                    raw,
+                                    flags=re.IGNORECASE,
+                                )
+                            if m:
+                                args[k] = m[-1].strip()
+
+                        if not args:
+                            # Last resort: keep the raw string under "query" so downstream still sees it.
+                            args = {"query": raw}
+
+                        return json.dumps(args, ensure_ascii=False)
+
+                    if fn_name:
+                        fn["arguments"] = _coerce_to_json_args(fn_name, arg_str)
+                        call["function"] = fn
+                    normalized_calls.append(call)
+
+                tool_calls = normalized_calls
+                current_messages[-1]["tool_calls"] = tool_calls
 
             if not tool_calls:
                 # No tool calls, we're done
@@ -963,11 +1321,17 @@ class LLMToolClient:
                 # Respond to all tool calls with error messages to maintain valid conversation format
                 if include_tool_results:
                     for tool_call in tool_calls:
+                        if isinstance(tool_call, dict):
+                            tool_call_id = tool_call.get("id", "")
+                            tool_name = tool_call.get("function", {}).get("name", "")
+                        else:
+                            tool_call_id = tool_call.id
+                            tool_name = tool_call.function.name
                         current_messages.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_call.function.name,
+                                "tool_call_id": tool_call_id,
+                                "name": tool_name,
                                 "content": error_output.output,
                             }
                         )
@@ -977,8 +1341,12 @@ class LLMToolClient:
 
                 # Execute all tool calls in parallel
                 tool_execution_tasks = []
+                scheduled_calls: List[Tuple[Any, str, BaseTool]] = []
                 for tool_call in tool_calls:
-                    function_name = tool_call.function.name
+                    if isinstance(tool_call, dict):
+                        function_name = tool_call.get("function", {}).get("name", "")
+                    else:
+                        function_name = tool_call.function.name
 
                     if function_name not in tools_by_name:
                         if verbose:
@@ -991,14 +1359,24 @@ class LLMToolClient:
 
                     # Parse arguments
                     try:
-                        function_args = json.loads(tool_call.function.arguments)
+                        if isinstance(tool_call, dict):
+                            function_args = json.loads(
+                                tool_call.get("function", {}).get("arguments", "{}")
+                            )
+                        else:
+                            function_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError as e:
                         if verbose:
                             print(f"Error parsing tool arguments: {e}")
                         continue
 
-                    # Execute tool
-                    tool_execution_tasks.append(tool(function_args))
+                    # Execute tool (via shared executor for concurrency + in-flight de-dupe + caching)
+                    scheduled_calls.append((tool_call, function_name, tool))
+                    tool_execution_tasks.append(
+                        self._tool_executor.execute(
+                            ToolRequest(tool=tool, tool_input=function_args)
+                        )
+                    )
 
                 # Execute all tools in parallel
                 tool_outputs = await asyncio.gather(
@@ -1006,11 +1384,13 @@ class LLMToolClient:
                 )
 
                 # Process tool outputs and add to messages
-                for i, (tool_call, tool_output) in enumerate(
-                    zip(tool_calls, tool_outputs)
+                for (tool_call, function_name, tool), tool_output in zip(
+                    scheduled_calls, tool_outputs
                 ):
-                    function_name = tool_call.function.name
-                    tool = tools_by_name[function_name]
+                    if isinstance(tool_call, dict):
+                        tool_call_id = tool_call.get("id", "")
+                    else:
+                        tool_call_id = tool_call.id
                     # Handle exceptions from tool execution
                     if isinstance(tool_output, Exception):
                         tool_output_str = f"Error executing tool: {str(tool_output)}"
@@ -1020,7 +1400,7 @@ class LLMToolClient:
                             called=False,
                             timeout=False,
                             runtime=0,
-                            call_id=tool_call.id,
+                            call_id=tool_call_id,
                             raw_output=None,
                             tool_name=function_name,
                         )
@@ -1040,7 +1420,7 @@ class LLMToolClient:
                         current_messages.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": tool_call.id,
+                                "tool_call_id": tool_call_id,
                                 "name": function_name,
                                 "content": tool_output_str,
                             }
@@ -1126,6 +1506,13 @@ class LLMToolClient:
                     generated_text += f"\n<tool_output>{content}</tool_output>"
 
         final_token_count = self._count_tokens_messages(current_messages)
+        trace_model_input = str(os.environ.get("DR_TRACE_MODEL_INPUT", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         return GenerateWithToolsOutput(
             tool_calls=tool_calls_made,
             generated_text=generated_text,
@@ -1134,6 +1521,7 @@ class LLMToolClient:
             stopped_reason=(
                 "max_tokens" if final_token_count >= base_max_tokens else "natural"
             ),
+            model_input=({"messages": current_messages, "tools": tools} if trace_model_input else None),
         )
 
     async def _call_litellm_with_tools(
@@ -1151,11 +1539,12 @@ class LLMToolClient:
         config = self.generation_config
 
         # Build parameters
+        tool_choice = kwargs.pop("tool_choice", "auto")
         params = {
             "model": self.model_name,
             "messages": messages,
             "tools": tools,
-            "tool_choice": "auto",
+            "tool_choice": tool_choice,
             "temperature": (
                 temperature if temperature is not None else config.temperature
             ),
@@ -1172,6 +1561,9 @@ class LLMToolClient:
             params["api_key"] = self.api_key
         if self.base_url:
             params["api_base"] = self.base_url
+            # Force LiteLLM to treat this as an OpenAI-compatible endpoint without rewriting the model
+            # name (vLLM expects the served model name verbatim).
+            params["custom_llm_provider"] = "openai"
 
         # Add any additional kwargs
         params.update(kwargs)
@@ -1233,6 +1625,15 @@ class LLMToolClient:
             params["api_key"] = self.api_key
         if self.base_url:
             params["api_base"] = self.base_url
+            # Force LiteLLM to treat this as an OpenAI-compatible endpoint without rewriting the model
+            # name (vLLM expects the served model name verbatim).
+            params["custom_llm_provider"] = "openai"
+
+        # Safety: this "commercial api" path does NOT pass OpenAI-native tools.
+        # If callers accidentally pass tool_choice/tools through kwargs (e.g., via shared AgentInterface),
+        # OpenAI-compatible servers will reject the request: "When using tool_choice, tools must be set."
+        kwargs.pop("tool_choice", None)
+        kwargs.pop("tools", None)
 
         # Add any additional kwargs
         params.update(kwargs)
@@ -1259,8 +1660,13 @@ class LLMToolClient:
                         f"Found reasoning content: {repr(reasoning_content[:100])}..."
                     )
 
-            # Prepend reasoning content if available
-            if reasoning_content:
+            # Some OpenAI-compatible OSS servers put the *actual completion* in reasoning_content
+            # while leaving message.content empty. In that case, treat reasoning_content as content
+            # (do NOT wrap it in <think>...</think>, because downstream postprocessing strips <think>).
+            if reasoning_content and not original_content.strip():
+                content = str(reasoning_content)
+            # Otherwise, if we truly have separate reasoning, optionally prepend it.
+            elif reasoning_content:
                 content = f"<think>{reasoning_content}</think>\n{content}"
 
             # If the generation finished due to a stop token, add it back to the content

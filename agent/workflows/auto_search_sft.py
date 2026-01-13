@@ -10,6 +10,9 @@ import dotenv
 from dr_agent.agent_interface import BaseAgent
 from dr_agent.client import DocumentToolOutput, LLMToolClient, ToolOutput
 from dr_agent.shared_prompts import UNIFIED_TOOL_CALLING_STRUCTURED_PROMPTS
+from dr_agent.shared_prompts.native_tool_calling import (
+    STRUCTURED_PROMPTS as NATIVE_TOOL_CALLING_STRUCTURED_PROMPTS,
+)
 from dr_agent.tool_interface.chained_tool import ChainedTool
 from dr_agent.tool_interface.mcp_tools import (
     BaseTool,
@@ -31,8 +34,17 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
-# Make sure the .env file is in the root directory of the project rl-rag-mcp/.env
-dotenv.load_dotenv(Path(__file__).parent.parent.parent / ".env")
+# Load environment variables.
+# Default is repo root `.env` at /home/ubuntu/dr-tulu/.env, but allow overrides so
+# users can keep keys in a separate file without copying.
+_default_env_path = Path(__file__).parent.parent.parent / ".env"
+_override_env_path = os.environ.get("DR_TULU_ENV_FILE") or os.environ.get(
+    "DR_AGENT_ENV_FILE"
+)
+if _override_env_path:
+    dotenv.load_dotenv(_override_env_path)
+else:
+    dotenv.load_dotenv(_default_env_path)
 
 
 @dataclass
@@ -86,9 +98,13 @@ class SearchAgent(BaseAgent):
         question: str,
         dataset_name: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
+        tool_calling_mode: Optional[str] = None,
     ) -> str:
 
-        PROMPT = UNIFIED_TOOL_CALLING_STRUCTURED_PROMPTS[self.prompt_version]
+        if (tool_calling_mode or "").lower() == "native":
+            PROMPT = NATIVE_TOOL_CALLING_STRUCTURED_PROMPTS[self.prompt_version]
+        else:
+            PROMPT = UNIFIED_TOOL_CALLING_STRUCTURED_PROMPTS[self.prompt_version]
         system_prompt = PROMPT["system_prompt"]
 
         if dataset_name in [
@@ -102,7 +118,7 @@ class SearchAgent(BaseAgent):
             "dsqa",
         ]:
             instruction_field_name = "exact_answer"
-        elif dataset_name in ["sqav2", "genetic_diseases_qa"]:
+        elif dataset_name in ["sqav2", "genetic_diseases_qa", "scholarqa_cs2", "scholarqa-cs2"]:
             instruction_field_name = "long_form"
         elif dataset_name in ["healthbench", "deep_research_bench", "researchqa"]:
             instruction_field_name = "short_form"
@@ -155,9 +171,15 @@ class SearchAgent(BaseAgent):
             output_string = "".join(output_string.split("</think>")[1:]).strip()
 
         if "<answer>" in output_string:
-            output_string = (
+            # Prefer returning the full <answer>...</answer> content for long-form tasks.
+            # Only fall back to extracting a boxed short answer for short outputs.
+            answer_content = (
                 output_string.split("<answer>")[1].split("</answer>")[0].strip()
             )
+            answer_content = answer_content.replace("\boxed{", "\\boxed{")
+            if "\\boxed{" in answer_content and len(answer_content) < 2000:
+                return answer_content.split("\\boxed{")[1].split("}")[0].strip()
+            return answer_content
 
         # Replace the "\boxed{" with "\\boxed{"
         output_string = output_string.replace("\boxed{", "\\boxed{")
@@ -172,9 +194,18 @@ class SearchAgent(BaseAgent):
 class AnswerAgent(BaseAgent):
     prompt_version: str = "v20250907"
 
-    def prompt(self, question: str, history: str, dataset_name: str) -> str:
+    def prompt(
+        self,
+        question: str,
+        history: str,
+        dataset_name: str,
+        tool_calling_mode: Optional[str] = None,
+    ) -> str:
 
-        PROMPT = UNIFIED_TOOL_CALLING_STRUCTURED_PROMPTS[self.prompt_version]
+        if (tool_calling_mode or "").lower() == "native":
+            PROMPT = NATIVE_TOOL_CALLING_STRUCTURED_PROMPTS[self.prompt_version]
+        else:
+            PROMPT = UNIFIED_TOOL_CALLING_STRUCTURED_PROMPTS[self.prompt_version]
         if dataset_name in [
             "2wiki",
             "simpleqa",
@@ -184,7 +215,7 @@ class AnswerAgent(BaseAgent):
             "webwalker",
         ]:
             instruction_field_name = "exact_answer"
-        elif dataset_name in ["sqav2", "genetic_diseases_qa"]:
+        elif dataset_name in ["sqav2", "genetic_diseases_qa", "scholarqa_cs2", "scholarqa-cs2"]:
             instruction_field_name = "long_form"
         elif dataset_name in ["healthbench", "deep_research_bench", "researchqa"]:
             instruction_field_name = "short_form"
@@ -218,9 +249,15 @@ class AnswerAgent(BaseAgent):
             output_string = "".join(output_string.split("</think>")[1:]).strip()
 
         if "<answer>" in output_string:
-            output_string = (
+            # Prefer returning the full <answer>...</answer> content for long-form tasks.
+            # Only fall back to extracting a boxed short answer for short outputs.
+            answer_content = (
                 output_string.split("<answer>")[1].split("</answer>")[0].strip()
             )
+            answer_content = answer_content.replace("\boxed{", "\\boxed{")
+            if "\\boxed{" in answer_content and len(answer_content) < 2000:
+                return answer_content.split("\\boxed{")[1].split("}")[0].strip()
+            return answer_content
 
         # Replace the "\boxed{" with "\\boxed{"
         output_string = output_string.replace("\boxed{", "\\boxed{")
@@ -278,6 +315,14 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         search_agent_max_tokens: int = 32000
         search_agent_temperature: float = 0.7
         search_agent_max_tool_calls: int = 10
+        # Tool calling mode:
+        # - "parser": repo's custom <tool>...</tool> text parsing
+        # - "native": OpenAI-style tool_calls via vLLM/OpenAI-compatible servers
+        search_agent_tool_calling_mode: str = "parser"
+        # Optional: force a specific tool call on the first native-tool iteration.
+        # Useful for integration tests that must verify actual tool use.
+        # Example: "snippet_search"
+        search_agent_force_first_tool: Optional[str] = None
 
         use_browse_agent: bool = False
         browse_agent_base_url: Optional[str] = None
@@ -286,6 +331,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         browse_agent_api_key: str = "dummy-key"
         browse_agent_max_tokens: int = 32000
         browse_agent_temperature: float = 0.3
+        browse_agent_tool_calling_mode: str = "parser"
 
         # MCP transport configuration
         mcp_transport_type: str = "StreamableHttpTransport"
@@ -640,6 +686,13 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
             max_tokens=cfg.search_agent_max_tokens,
             temperature=cfg.search_agent_temperature,
             max_tool_calls=cfg.search_agent_max_tool_calls,
+            tool_calling_mode=cfg.search_agent_tool_calling_mode,
+            tool_choice=(
+                {"type": "function", "function": {"name": cfg.search_agent_force_first_tool}}
+                if (cfg.search_agent_tool_calling_mode or "").lower() == "native"
+                and cfg.search_agent_force_first_tool
+                else "auto"
+            ),
             verbose=verbose,
             on_step_callback=step_callback,
         )
@@ -661,7 +714,12 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 failed_tool_calls += 1
                 failed_tool_call_errors.append(tool_output.error)
 
-            if tool_output.tool_name in ["snippet_search", "google_search"]:
+            if tool_output.tool_name in [
+                "snippet_search",
+                "google_search",
+                "serper_google_webpage_search",
+                "semantic_scholar_snippet_search",
+            ]:
                 searched_links.extend(
                     [document.url for document in tool_output.documents]
                 )
@@ -708,6 +766,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
             generation_prefix="<answer>",
             max_tokens=cfg.search_agent_max_tokens,
             temperature=cfg.search_agent_temperature,
+            tool_calling_mode=cfg.search_agent_tool_calling_mode,
             verbose=verbose,
             on_step_callback=step_callback,
         )
