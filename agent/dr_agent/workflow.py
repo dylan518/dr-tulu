@@ -607,8 +607,8 @@ class BaseWorkflow(ABC):
             self.logger.info("All examples already processed")
             return []
 
-        # Add the dataset name to the remaining dataset
-        if "dataset_name" not in remaining_dataset[0]:
+        # Ensure dataset_name is set (some datasets include a null/None dataset_name field).
+        if ("dataset_name" not in remaining_dataset[0]) or (not remaining_dataset[0].get("dataset_name")):
             for item in remaining_dataset:
                 item["dataset_name"] = dataset_config["name"]
 
@@ -694,13 +694,78 @@ class BaseWorkflow(ABC):
                     full_traces = res.pop("full_traces")
 
                     if output_messages_schema:
-                        ft_dump = (
-                            full_traces.model_dump()
-                            if hasattr(full_traces, "model_dump")
-                            else dict(full_traces or {})
-                        )
-                        model_input = ft_dump.get("model_input") or {}
-                        messages = model_input.get("messages")
+                        # Prefer a workflow-provided stitched transcript if available.
+                        messages = res.get("messages") if isinstance(res, dict) else None
+                        if not isinstance(messages, list):
+                            ft_dump = (
+                                full_traces.model_dump()
+                                if hasattr(full_traces, "model_dump")
+                                else dict(full_traces or {})
+                            )
+                            model_input = ft_dump.get("model_input") or {}
+                            messages = model_input.get("messages")
+
+                        # Normalize to a canonical OpenAI-style message trace:
+                        # - tool-call turns: assistant(content=None, tool_calls=[...]) (no channel)
+                        # - if assistant text exists on the same turn, split it into assistant(channel="analysis")
+                        def _normalize_messages_for_export(msgs: Any) -> List[Dict[str, Any]]:
+                            if not isinstance(msgs, list):
+                                return []
+                            out: List[Dict[str, Any]] = []
+                            for m in msgs:
+                                if not isinstance(m, dict):
+                                    continue
+                                role = m.get("role")
+                                tool_calls = m.get("tool_calls")
+                                content = m.get("content")
+
+                                if role == "assistant" and tool_calls:
+                                    if isinstance(content, str) and content.strip():
+                                        out.append(
+                                            {
+                                                "role": "assistant",
+                                                "channel": "analysis",
+                                                "content": content,
+                                            }
+                                        )
+                                    out.append(
+                                        {
+                                            "role": "assistant",
+                                            "content": None,
+                                            "tool_calls": tool_calls,
+                                        }
+                                    )
+                                    continue
+
+                                if role == "assistant":
+                                    m2 = dict(m)
+                                    ch = m2.get("channel")
+                                    if ch not in {"analysis", "final"}:
+                                        m2.pop("channel", None)
+                                    out.append(m2)
+                                else:
+                                    out.append(dict(m))
+                            return out
+
+                        messages = _normalize_messages_for_export(messages)
+
+                        # Append a canonical final message if we have a parsed final_response.
+                        # This matches the common schema:
+                        #   {"role":"assistant","channel":"final","content":"..."}
+                        if isinstance(final_response, str) and final_response.strip():
+                            last_assistant = None
+                            for m in reversed(messages):
+                                if isinstance(m, dict) and m.get("role") == "assistant":
+                                    last_assistant = m
+                                    break
+                            if not (isinstance(last_assistant, dict) and last_assistant.get("channel") == "final"):
+                                messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "channel": "final",
+                                        "content": final_response,
+                                    }
+                                )
                         eval_output = {
                             "example_id": ex["id"],
                             "problem": ex["problem"],
@@ -714,6 +779,10 @@ class BaseWorkflow(ABC):
                             "full_traces": full_traces.model_dump(),
                         }
                     if len(res):
+                        # Avoid exporting duplicate transcripts:
+                        # when DR_OUTPUT_MESSAGES_SCHEMA=1, the canonical trace is already at top-level `messages`.
+                        if output_messages_schema and isinstance(res, dict) and "messages" in res:
+                            res.pop("messages", None)
                         eval_output["additional_output_data"] = res
                     if include_original_data:
                         eval_output["original_data"] = ex
@@ -731,71 +800,12 @@ class BaseWorkflow(ABC):
             await asyncio.gather(*workers, return_exceptions=True)
 
         else:
-            # Legacy batching (kept for backwards compatibility)
-            for i in range(0, len(remaining_dataset), batch_size):
-                batch = remaining_dataset[i : i + batch_size]
-                batch_to_process = [
-                    {k: v for k, v in item.items() if k in call_params} for item in batch
-                ]
-
-                self.logger.info(
-                    f"Processing batch {i//batch_size + 1}/{(len(remaining_dataset) + batch_size - 1)//batch_size}"
+            # Legacy batching (receiver_consumer=False) used to live here.
+            # The receiver/consumer path is the supported and tested path now (especially for
+            # correct tool-call/message-trace formatting).
+            raise NotImplementedError(
+                "Legacy batching path is disabled; use receiver_consumer=True"
                 )
-
-                try:
-                    batch_results = await self.map(
-                        batch_to_process,
-                        max_concurrent_tasks=max_concurrent_tasks,
-                        progress_desc=f"Batch {i//batch_size + 1}",
-                        **workflow_kwargs,
-                    )
-
-                    formatted_results = []
-                    for example, result in zip(batch, batch_results):
-                        result = result.copy()
-                        final_response = result.pop("final_response")
-                        full_traces = result.pop("full_traces")
-
-                        if output_messages_schema:
-                            ft_dump = (
-                                full_traces.model_dump()
-                                if hasattr(full_traces, "model_dump")
-                                else dict(full_traces or {})
-                            )
-                            model_input = ft_dump.get("model_input") or {}
-                            messages = model_input.get("messages")
-                            eval_output = {
-                                "example_id": example["id"],
-                                "problem": example["problem"],
-                                "messages": messages if isinstance(messages, list) else [],
-                            }
-                        else:
-                            eval_output = {
-                                "example_id": example["id"],
-                                "problem": example["problem"],
-                                "final_response": final_response,
-                                "full_traces": full_traces.model_dump(),
-                            }
-
-                        if len(result):
-                            eval_output["additional_output_data"] = result
-
-                        if include_original_data:
-                            eval_output["original_data"] = example
-
-                        formatted_results.append(eval_output)
-
-                    all_results.extend(formatted_results)
-
-                    if output_path:
-                        with open(output_path, "a") as f:
-                            for result in formatted_results:
-                                f.write(json.dumps(result) + "\n")
-
-                except Exception as e:
-                    self.logger.error(
-                        f"Error processing batch {i//batch_size + 1}: {e}. Continuing with next batch."
-                    )
 
         # Sort final file by original dataset order if output file was provided
         if output_path and os.path.exists(output_path):

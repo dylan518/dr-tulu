@@ -223,3 +223,7 @@ uv.lock
 import
 PY
 eval_output/
+
+# Large local artifacts / caches (do not commit)
+hf_datasets_cache_s100/
+synthetic_traces/

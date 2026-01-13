@@ -53,7 +53,19 @@ class Tool:
 
 class MaxCallsExceededTool(Tool):
     def __call__(self, prompt: str) -> ToolOutput:
-        return ToolOutput(output="Max tool calls exceeded.", called=False, error="Max tool calls exceeded", timeout=False, runtime=0)
+        # IMPORTANT: This is injected when the model has exceeded the tool-call budget.
+        # The goal is to end the tool loop and force a final answer.
+        return ToolOutput(
+            output=(
+                "TOOL BUDGET EXHAUSTED. You MUST NOT call any more tools. "
+                "Provide your best final answer now using ONLY the information already retrieved. "
+                "Follow the required output format exactly."
+            ),
+            called=False,
+            error="Tool budget exhausted",
+            timeout=False,
+            runtime=0,
+        )
 
 
 class PythonCodeTool(Tool):
@@ -149,10 +161,24 @@ class PythonCodeTool(Tool):
 
 
 class ToolUseLLM(LLM):
-    def __init__(self, tools: dict[str, Tool] = None, max_tool_calls: Union[int, dict[str, int]] = 4, *args, **kwargs):
+    def __init__(
+        self,
+        tools: dict[str, Tool] = None,
+        max_tool_calls: Union[int, dict[str, int], None] = 4,
+        *args,
+        **kwargs,
+    ):
         self.tools = tools
-        # Convert max_tool_calls to a dict if it's an int
-        if isinstance(max_tool_calls, int):
+        # Tool-call limit handling:
+        # - None or <0 means "unlimited" (no MaxCallsExceededTool injection).
+        # - int >= 0 applies uniformly to all tool stop strings.
+        # - dict[str,int] applies per tool stop string.
+        self.unlimited_tool_calls = max_tool_calls is None or (
+            isinstance(max_tool_calls, int) and max_tool_calls < 0
+        )
+        if self.unlimited_tool_calls:
+            self.max_tool_calls = {}
+        elif isinstance(max_tool_calls, int):
             self.max_tool_calls = {k: max_tool_calls for k in tools.keys()} if tools else {}
         else:
             self.max_tool_calls = max_tool_calls
@@ -272,11 +298,11 @@ class ToolUseLLM(LLM):
                         tool_output_token_ids = tool_output_token_ids[:remaining]
                     concat_outputs[req_id].outputs[0].token_ids.extend(tool_output_token_ids)
                     if len(concat_outputs[req_id].outputs[0].token_ids) > self.single_n_sampling_params.max_tokens:
-                        breakpoint()
-                        raise ValueError(
-                            f"ToolUseLLM generated more response tokens than max_tokens! "
-                            f"len(concat_outputs[req_id].outputs[0].token_ids): {len(concat_outputs[req_id].outputs[0].token_ids)}"
-                        )
+                        # Clip instead of crashing (common off-by-one/edge cases when stitching tool outputs).
+                        max_toks = int(self.single_n_sampling_params.max_tokens)
+                        concat_outputs[req_id].outputs[0].token_ids = concat_outputs[req_id].outputs[0].token_ids[:max_toks]
+                        masks[req_id] = masks[req_id][:max_toks]
+                        can_make_new_request = False
                     masks[req_id].extend([0] * len(tool_output_token_ids))
                     new_sample_tokens = self.single_n_sampling_params.max_tokens - len(masks[req_id])
                     can_make_new_request = can_make_new_request and new_sample_tokens > 0
@@ -319,17 +345,19 @@ class ToolUseLLM(LLM):
                                 len(concat_outputs[output.request_id].outputs[0].token_ids)
                                 > self.single_n_sampling_params.max_tokens
                             ):
-                                breakpoint()
-                                raise ValueError(
-                                    f"ToolUseLLM generated more response tokens than max_tokens! "
-                                    f"len(concat_outputs[output.request_id].outputs[0].token_ids): {len(concat_outputs[output.request_id].outputs[0].token_ids)}"
-                                )
+                                # Clip instead of crashing; we'll just stop generation for this request.
+                                max_toks = int(self.single_n_sampling_params.max_tokens)
+                                concat_outputs[output.request_id].outputs[0].token_ids = concat_outputs[output.request_id].outputs[0].token_ids[:max_toks]
+                                masks[output.request_id] = masks[output.request_id][:max_toks]
                         masks[output.request_id].extend([1] * len(o.token_ids))
                         for stop_str in self.single_n_sampling_params.stop:
                             if (
                                 o.text.endswith(stop_str)
                                 and stop_str in self.tools
-                                and num_calls[output.request_id] <= self.max_tool_calls[stop_str]
+                                and (
+                                    self.unlimited_tool_calls
+                                    or num_calls[output.request_id] <= self.max_tool_calls.get(stop_str, 0)
+                                )
                             ):
                                 # Schedule tool call asynchronously
                                 tool = self.tools[stop_str]
@@ -340,7 +368,10 @@ class ToolUseLLM(LLM):
                             elif (
                                 o.text.endswith(stop_str)
                                 and stop_str in self.tools
-                                and num_calls[output.request_id] > self.max_tool_calls[stop_str]
+                                and (
+                                    (not self.unlimited_tool_calls)
+                                    and num_calls[output.request_id] > self.max_tool_calls.get(stop_str, 0)
+                                )
                             ):
                                 # If the tool has been called too many times, we tell the model it has exceeded the limit.
                                 # use a dummy tool object to keep things simple.
@@ -383,7 +414,6 @@ class ToolUseLLM(LLM):
             setattr(concat_outputs[req_id].outputs[0], "tool_called", tool_called[req_id])
             if len(masks[req_id]) != len(concat_outputs[req_id].outputs[0].token_ids):
                 visualize_token_role(concat_outputs[req_id].outputs[0].token_ids, masks[req_id], tokenizer)
-                breakpoint()
                 raise ValueError(
                     f"Mask length {len(masks[req_id])} does not match "
                     f"token IDs length {len(concat_outputs[req_id].outputs[0].token_ids)}"
@@ -393,11 +423,11 @@ class ToolUseLLM(LLM):
         merged_outputs = {}
         for req_id in concat_outputs:
             if len(concat_outputs[req_id].outputs[0].token_ids) > self.single_n_sampling_params.max_tokens:
-                breakpoint()
-                raise ValueError(
-                    f"ToolUseLLM generated more response tokens than max_tokens! "
-                    f"len(concat_outputs[req_id].outputs[0].token_ids): {len(concat_outputs[req_id].outputs[0].token_ids)}"
-                )
+                max_toks = int(self.single_n_sampling_params.max_tokens)
+                concat_outputs[req_id].outputs[0].token_ids = concat_outputs[req_id].outputs[0].token_ids[:max_toks]
+                # Keep mask aligned if present
+                if req_id in masks:
+                    masks[req_id] = masks[req_id][:max_toks]
             real_req_id, _ = req_id.split("-")
             if real_req_id not in merged_outputs:
                 merged_outputs[real_req_id] = concat_outputs[req_id]

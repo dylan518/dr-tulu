@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
-from datasets import Dataset, load_dataset, load_from_disk
+from datasets import Dataset, Features, Sequence, Value, load_dataset, load_from_disk
 
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
@@ -129,7 +130,7 @@ def _load_single_dataset(
     elif dataset_attr.load_from == "cloud_file":
         dataset = Dataset.from_list(read_cloud_json(data_path), split=dataset_attr.split)
     else:
-        dataset = load_dataset(
+        load_kwargs = dict(
             path=data_path,
             name=data_name,
             data_dir=data_dir,
@@ -138,9 +139,51 @@ def _load_single_dataset(
             cache_dir=model_args.cache_dir,
             token=model_args.hf_hub_token,
             num_proc=data_args.preprocessing_num_workers,
-            trust_remote_code=model_args.trust_remote_code,
             streaming=data_args.streaming and dataset_attr.load_from != "file",
         )
+        # `datasets>=4` dropped `trust_remote_code` (it raises an error). Keep backward compatibility.
+        if "trust_remote_code" in inspect.signature(load_dataset).parameters:
+            load_kwargs["trust_remote_code"] = model_args.trust_remote_code
+
+        try:
+            dataset = load_dataset(**load_kwargs)
+        except ValueError as err:
+            # Work around a known HF datasets cache/metadata mismatch for ShareGPT-style datasets where
+            # `conversations` is stored as a struct-of-lists (role/content) but metadata expects list-of-structs.
+            # We first load with forced Features to match the on-disk schema, then convert to list-of-dicts.
+            err_msg = str(err)
+            if "Type mismatch" in err_msg and " at conversations" in err_msg and "features" not in load_kwargs:
+                logger.warning_rank0_once(
+                    "Detected `conversations` feature mismatch in dataset cache. "
+                    "Reloading with forced features and converting schema."
+                )
+                load_kwargs_with_features = dict(load_kwargs)
+                load_kwargs_with_features["features"] = Features(
+                    {
+                        "conversations": {
+                            "role": Sequence(Value("string")),
+                            "content": Sequence(Value("string")),
+                        }
+                    }
+                )
+                dataset = load_dataset(**load_kwargs_with_features)
+
+                def _fix_conversations_schema(example: dict) -> dict:
+                    conv = example.get("conversations")
+                    if isinstance(conv, dict) and isinstance(conv.get("role"), list) and isinstance(conv.get("content"), list):
+                        example["conversations"] = [
+                            {"role": r, "content": c} for r, c in zip(conv["role"], conv["content"])
+                        ]
+                    return example
+
+                if (not data_args.streaming) and ("conversations" in dataset.column_names):
+                    dataset = dataset.map(
+                        _fix_conversations_schema,
+                        num_proc=data_args.preprocessing_num_workers,
+                        desc="Fix conversations schema",
+                    )
+            else:
+                raise
         if data_args.streaming and dataset_attr.load_from == "file":
             dataset = dataset.to_iterable_dataset(num_shards=training_args.dataloader_num_workers)
 

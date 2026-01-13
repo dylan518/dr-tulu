@@ -1311,8 +1311,12 @@ class JinaBrowseTool(MCPBrowseTool):
 
     def get_mcp_params(self, tool_call_info: ToolCallInfo) -> Dict[str, Any]:
         """Build parameters for Jina Reader API"""
+        url = (tool_call_info.content or "").strip()
+        # Some models emit "view-source:https://..." which Jina rejects.
+        if url.lower().startswith("view-source:"):
+            url = url.split(":", 1)[1].strip()
         return {
-            "webpage_url": tool_call_info.content,
+            "webpage_url": url,
             "timeout": self.request_timeout,
         }
 

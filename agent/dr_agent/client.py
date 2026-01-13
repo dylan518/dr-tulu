@@ -740,7 +740,8 @@ class LLMToolClient:
                 break
 
             # Check if we've exceeded the maximum number of tool calls
-            if tool_call_count + len(extracted_calls) > max_tool_calls:
+            remaining_budget = max_tool_calls - tool_call_count
+            if remaining_budget <= 0:
                 if verbose:
                     print(
                         f"Exceeded maximum tool calls ({max_tool_calls}), creating error output."
@@ -760,6 +761,10 @@ class LLMToolClient:
                     current_messages.append({"role": "user", "content": error_formatted})
                 break
 
+            # If we have more calls than remaining budget, execute what we can and return errors for the rest.
+            to_run = extracted_calls[: max(0, remaining_budget)]
+            to_error = extracted_calls[len(to_run) :]
+
             if verbose:
                 tool_names = [t.name for (t, _, _) in extracted_calls]
                 print(f"Found {len(extracted_calls)} tool call(s): {tool_names}")
@@ -767,7 +772,7 @@ class LLMToolClient:
             # Execute all tools concurrently via the shared executor
             reqs = [
                 ToolRequest(tool=tool, tool_input=call_text, call_info=call_info)
-                for (tool, call_info, call_text) in extracted_calls
+                for (tool, call_info, call_text) in to_run
             ]
             tool_outputs = await asyncio.gather(
                 *(self._tool_executor.execute(r) for r in reqs), return_exceptions=True
@@ -775,7 +780,7 @@ class LLMToolClient:
 
             realized_outputs: List[ToolOutput] = []
             for (tool, _call_info, _call_text), tool_output in zip(
-                extracted_calls, tool_outputs
+                to_run, tool_outputs
             ):
                 if isinstance(tool_output, Exception):
                     realized_outputs.append(
@@ -788,6 +793,17 @@ class LLMToolClient:
                     )
                 else:
                     realized_outputs.append(tool_output)
+
+            # Add budget-exceeded errors for the remainder.
+            for (tool, _call_info, _call_text) in to_error:
+                realized_outputs.append(
+                    tool._create_error_output(
+                        error_msg=f"Exceeded maximum tool calls ({max_tool_calls})",
+                        call_id="",
+                        runtime=0,
+                        output="Exceeded allowed tool call requests. Please stop calling tools and provide the final answer.",
+                    )
+                )
 
             tool_call_count += len(realized_outputs)
             tool_calls.extend(realized_outputs)
@@ -805,8 +821,9 @@ class LLMToolClient:
                     on_step_callback("", realized_outputs)
 
             if include_tool_results:
+                # We no longer have per-output tool mapping for budget errors; best-effort append.
                 for (tool, _call_info, _call_text), out in zip(
-                    extracted_calls, realized_outputs
+                    (to_run + to_error), realized_outputs
                 ):
                     if out.called:
                         result_formatted = tool.format_result(out)
@@ -815,6 +832,10 @@ class LLMToolClient:
                         )
                         if verbose:
                             print(f"Tool '{tool.name}' output: {out.output[:200]}...")
+
+            # If we had to truncate tool calls due to budget, stop tool execution loop and let the model answer.
+            if to_error:
+                break
 
             # Check token limit again after adding tool results
             final_token_count = self._count_tokens_messages(current_messages)
@@ -960,7 +981,8 @@ class LLMToolClient:
                 break
 
             # Check if we've exceeded the maximum number of tool calls
-            if tool_call_count + len(extracted_calls) > max_tool_calls:
+            remaining_budget = max_tool_calls - tool_call_count
+            if remaining_budget <= 0:
                 if verbose:
                     print(
                         f"Exceeded maximum tool calls ({max_tool_calls}), creating error output."
@@ -980,60 +1002,78 @@ class LLMToolClient:
                     error_formatted = tool0.format_result(error_output)
                     current_context += "\n" + error_formatted
 
-            else:
-                if verbose:
-                    tool_names = [t.name for (t, _, _) in extracted_calls]
-                    print(f"Found {len(extracted_calls)} tool call(s): {tool_names}")
+                break
 
-                reqs = [
-                    ToolRequest(tool=tool, tool_input=call_text, call_info=call_info)
-                    for (tool, call_info, call_text) in extracted_calls
-                ]
-                tool_outputs = await asyncio.gather(
-                    *(self._tool_executor.execute(r) for r in reqs),
-                    return_exceptions=True,
-                )
+            # If we have more calls than remaining budget, execute what we can and return errors for the rest.
+            to_run = extracted_calls[: max(0, remaining_budget)]
+            to_error = extracted_calls[len(to_run) :]
 
-                realized_outputs: List[ToolOutput] = []
-                for (tool, _call_info, _call_text), tool_output in zip(
-                    extracted_calls, tool_outputs
-                ):
-                    if isinstance(tool_output, Exception):
-                        realized_outputs.append(
-                            tool._create_error_output(
-                                error_msg=str(tool_output),
-                                call_id="",
-                                runtime=0,
-                                output=f"Error executing tool: {str(tool_output)}",
-                            )
-                        )
-                    else:
-                        realized_outputs.append(tool_output)
+            if verbose:
+                tool_names = [t.name for (t, _, _) in extracted_calls]
+                print(f"Found {len(extracted_calls)} tool call(s): {tool_names}")
 
-                tool_call_count += len(realized_outputs)
-                tool_calls.extend(realized_outputs)
+            reqs = [
+                ToolRequest(tool=tool, tool_input=call_text, call_info=call_info)
+                for (tool, call_info, call_text) in to_run
+            ]
+            tool_outputs = await asyncio.gather(
+                *(self._tool_executor.execute(r) for r in reqs),
+                return_exceptions=True,
+            )
 
-                if on_step_callback:
-                    is_async = asyncio.iscoroutinefunction(on_step_callback) or (
-                        callable(on_step_callback)
-                        and asyncio.iscoroutinefunction(
-                            getattr(on_step_callback, "__call__", None)
+            realized_outputs: List[ToolOutput] = []
+            for (tool, _call_info, _call_text), tool_output in zip(
+                to_run, tool_outputs
+            ):
+                if isinstance(tool_output, Exception):
+                    realized_outputs.append(
+                        tool._create_error_output(
+                            error_msg=str(tool_output),
+                            call_id="",
+                            runtime=0,
+                            output=f"Error executing tool: {str(tool_output)}",
                         )
                     )
-                    if is_async:
-                        await on_step_callback("", realized_outputs)
-                    else:
-                        on_step_callback("", realized_outputs)
+                else:
+                    realized_outputs.append(tool_output)
+
+            for (tool, _call_info, _call_text) in to_error:
+                realized_outputs.append(
+                    tool._create_error_output(
+                        error_msg=f"Exceeded maximum tool calls ({max_tool_calls})",
+                        call_id="",
+                        runtime=0,
+                        output="Exceeded allowed tool call requests. Please stop calling tools and provide the final answer.",
+                    )
+                )
+
+            tool_call_count += len(realized_outputs)
+            tool_calls.extend(realized_outputs)
+
+            if on_step_callback:
+                is_async = asyncio.iscoroutinefunction(on_step_callback) or (
+                    callable(on_step_callback)
+                    and asyncio.iscoroutinefunction(
+                        getattr(on_step_callback, "__call__", None)
+                    )
+                )
+                if is_async:
+                    await on_step_callback("", realized_outputs)
+                else:
+                    on_step_callback("", realized_outputs)
 
                 if include_tool_results:
                     for (tool, _call_info, _call_text), out in zip(
-                        extracted_calls, realized_outputs
+                        (to_run + to_error), realized_outputs
                     ):
                         if out.called:
                             result_formatted = tool.format_result(out)
                             current_context += result_formatted
                             if verbose:
                                 print(f"Tool '{tool.name}' output: {out.output[:200]}...")
+
+                if to_error:
+                    break
 
             # Check token limit again after adding tool results
             final_token_count = self._count_tokens(current_context)
@@ -1159,7 +1199,7 @@ class LLMToolClient:
             # OSS vLLM may return the completion in reasoning_content and leave content empty/None.
             rm_content = (response_message.content or "") if response_message else ""
             if not rm_content:
-                rm_content = (
+                rc = (
                     getattr(response_message, "reasoning_content", None)
                     or (
                         isinstance(
@@ -1169,13 +1209,22 @@ class LLMToolClient:
                     )
                     or ""
                 )
+                if rc:
+                    rm_content = rc
 
+            # NOTE:
+            # - "channel" is not part of the OpenAI Chat Completions request schema; we should not
+            #   inject it into the live conversation we send back to the model.
+            # - For OSS, `reasoning_content` is often where the *assistant text* lives; we treat it
+            #   as normal assistant content here.
+            #
             # Append assistant's response to messages (contains tool_calls if any)
+            tool_calls_raw = getattr(response_message, "tool_calls", None)
             current_messages.append(
                 {
                     "role": "assistant",
                     "content": rm_content,
-                    "tool_calls": getattr(response_message, "tool_calls", None),
+                    "tool_calls": tool_calls_raw,
                 }
             )
 
@@ -1189,7 +1238,7 @@ class LLMToolClient:
                 break
 
             # Check for tool calls
-            tool_calls = getattr(response_message, "tool_calls", None)
+            tool_calls = tool_calls_raw
 
             # Some OpenAI-compatible servers/models emit tool calls in the assistant content
             # (e.g., "<tool_call>tool?arg=val</tool_call>") but do not populate tool_calls.
@@ -1288,6 +1337,10 @@ class LLMToolClient:
                         fn["arguments"] = _coerce_to_json_args(fn_name, arg_str)
                         call["function"] = fn
                     normalized_calls.append(call)
+
+                # Update the last assistant message in-place so downstream logging / tracing
+                # sees JSON-safe tool call dicts (no OpenAI SDK objects).
+                current_messages[-1]["tool_calls"] = normalized_calls
 
                 tool_calls = normalized_calls
                 current_messages[-1]["tool_calls"] = tool_calls

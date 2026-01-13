@@ -198,7 +198,7 @@ class AnswerAgent(BaseAgent):
         self,
         question: str,
         history: str,
-        dataset_name: str,
+        dataset_name: Optional[str],
         tool_calling_mode: Optional[str] = None,
     ) -> str:
 
@@ -220,7 +220,12 @@ class AnswerAgent(BaseAgent):
         elif dataset_name in ["healthbench", "deep_research_bench", "researchqa"]:
             instruction_field_name = "short_form"
         else:
-            raise ValueError(f"Invalid dataset name: {dataset_name}")
+            # Be permissive: some datasets / custom JSONLs may omit dataset_name.
+            # Default to long-form instructions for research-style answers.
+            if dataset_name and "short_form" in str(dataset_name):
+                instruction_field_name = "short_form"
+            else:
+                instruction_field_name = "long_form"
 
         return [
             {
@@ -591,15 +596,15 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 mcp_port=mcp_port,
             )
         elif cfg.browse_tool_name is None:
-            self.browse_tool = NoBrowseTool(
-                tool_parser=cfg.tool_parser,
-                name="browse_webpage",
-            )
+            # If browse is disabled, do NOT expose a fake browse tool to the model.
+            # Otherwise models will attempt page-local "find"/pagination behaviors (e.g. find_in_page, loc/id paging)
+            # that our MCP-backed browse tools do not implement, leading to hallucinated tool calls and bad traces.
+            self.browse_tool = None
         else:
             raise ValueError(f"Invalid browse tool name: {cfg.browse_tool_name}")
         print("Using browse tool: ", self.browse_tool)
 
-        if cfg.use_browse_agent:
+        if cfg.use_browse_agent and self.browse_tool is not None:
             with LLMToolClient(
                 model_name=cfg.browse_agent_model_name,
                 tokenizer_name=cfg.browse_agent_tokenizer_name,
@@ -625,9 +630,10 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
             base_url=cfg.search_agent_base_url,
             api_key=cfg.search_agent_api_key,
         ) as client:
+            tools: List[BaseTool] = [t for t in [self.search_tool, self.search_tool2, self.composed_browse_tool] if t is not None]
             self.search_agent = SearchAgent(
                 client=client,
-                tools=[self.search_tool, self.search_tool2, self.composed_browse_tool],
+                tools=tools,
                 prompt_version=cfg.prompt_version,
             )
             self.answer_agent = AnswerAgent(
@@ -670,14 +676,15 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         # Set the question for the browse agent
         # TODO: This is a bit hectic and hacky, but it works for now
         # The problem: it uses a bad way to enable the runtime dynamics
-        if isinstance(self.composed_browse_tool, ChainedTool):
-            browse_tool = self.composed_browse_tool.tools[0]
-            browse_tool.bm25_query = problem
-            browse_agent = self.composed_browse_tool.tools[-1]
-            browse_agent.agent.question = problem
-        else:
-            browse_tool = self.composed_browse_tool
-            browse_tool.bm25_query = problem
+        if self.composed_browse_tool is not None:
+            if isinstance(self.composed_browse_tool, ChainedTool):
+                browse_tool = self.composed_browse_tool.tools[0]
+                browse_tool.bm25_query = problem
+                browse_agent = self.composed_browse_tool.tools[-1]
+                browse_agent.agent.question = problem
+            else:
+                browse_tool = self.composed_browse_tool
+                browse_tool.bm25_query = problem
 
         results = await self.search_agent(
             question=problem,
@@ -776,9 +783,48 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
 
         answer.tool_calls = [results.model_dump()]
 
+        # Optional: stitch search+answer model inputs into a single transcript for JSONL export.
+        # Enable by setting DR_OUTPUT_MESSAGES_SCHEMA=1 and DR_TRACE_MODEL_INPUT=1.
+        stitched_messages = None
+        if str(os.environ.get("DR_OUTPUT_MESSAGES_SCHEMA", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            try:
+                search_msgs = getattr(results, "model_input", None)
+                search_msgs = (
+                    (search_msgs or {}).get("messages")
+                    if isinstance(search_msgs, dict)
+                    else None
+                )
+                answer_msgs = getattr(answer, "model_input", None)
+                answer_msgs = (
+                    (answer_msgs or {}).get("messages")
+                    if isinstance(answer_msgs, dict)
+                    else None
+                )
+                if isinstance(search_msgs, list) and isinstance(answer_msgs, list):
+                    # Avoid duplicated answers by merging on the *longest common prefix*.
+                    # (The answer step often re-sends system/user history.)
+                    def _lcp_len(a, b) -> int:
+                        n = min(len(a), len(b))
+                        i = 0
+                        while i < n and a[i] == b[i]:
+                            i += 1
+                        return i
+
+                    k = _lcp_len(search_msgs, answer_msgs)
+                    stitched_messages = list(search_msgs) + list(answer_msgs[k:])
+            except Exception:
+                stitched_messages = None
+
         return {
             "final_response": self.answer_agent.postprocess_output(answer),
             "full_traces": answer,
+            **({"messages": stitched_messages} if isinstance(stitched_messages, list) else {}),
             "browsed_links": browsed_links,
             "searched_links": searched_links,
         }
