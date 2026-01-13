@@ -1,0 +1,50 @@
+### model
+model_name_or_path: RedMod/rl_1023_s100_q
+trust_remote_code: true
+flash_attn: sdpa
+disable_gradient_checkpointing: false
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json
+
+### dataset
+dataset: rl-research/dr-tulu-sft-data
+template: qwen3
+cutoff_len: 4096
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+use_span_masking: true
+mask_span_types: "tool_output"
+
+### output
+output_dir: ckpts/redmod-rl_1023_s100_q/sft-e3
+overwrite_output_dir: true
+plot_loss: true
+logging_steps: 5
+report_to: none
+
+# IMPORTANT: enable resumable checkpoints (needed for "half tonight / half tomorrow")
+save_strategy: steps
+save_steps: 50
+save_total_limit: 2
+save_only_model: false
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 4.0e-5
+num_train_epochs: 3
+max_steps: 155
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+weight_decay: 0.00
+
+
+
+

@@ -1,0 +1,56 @@
+### model
+model_name_or_path: RedMod/rl_1023_s100_q
+trust_remote_code: true
+flash_attn: sdpa
+disable_gradient_checkpointing: false
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+
+### dataset
+# Requires an entry for "RedMod/rl_1023_s100_q" in data/dataset_info.json (added in this change).
+dataset: rl-research/dr-tulu-sft-data
+template: qwen3
+cutoff_len: 4096
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+use_span_masking: true
+mask_span_types: "tool_output"
+
+### output
+output_dir: ckpts/redmod-rl_1023_s100_q/sft-e3-save3xperepoch
+plot_loss: true
+overwrite_output_dir: false
+
+# Frequent checkpoints:
+# Prior logs show ~13062 examples. With 8 GPUs, batch=1, grad_accum=16 -> ~102 optimizer steps/epoch.
+# save_steps=34 ~= 3 saves per epoch.
+save_strategy: steps
+save_steps: 34
+save_total_limit: 12
+save_only_model: false
+
+logging_steps: 5
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 4.0e-5
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+weight_decay: 0.00
+
+# Set this to a checkpoint path when resuming, e.g.:
+# ckpts/redmod-rl_1023_s100_q/sft-e3-save3xperepoch/checkpoint-136
+resume_from_checkpoint: null
+
+
+
