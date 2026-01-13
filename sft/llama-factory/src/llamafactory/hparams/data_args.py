@@ -47,6 +47,16 @@ class DataArguments:
         default=2048,
         metadata={"help": "The cutoff length of the tokenized inputs in the dataset."},
     )
+    sort_by_token_length: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to sort the *training* dataset by tokenized sequence length (ascending) after preprocessing. "
+                "This enables a simple length-based curriculum when combined with `disable_shuffling: true`. "
+                "Only supported in non-streaming mode."
+            )
+        },
+    )
     train_on_prompt: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the mask on the prompt."},

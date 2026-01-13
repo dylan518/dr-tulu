@@ -99,6 +99,25 @@ VLLM_NATIVE_TOOLS=1 \
 uv run pytest -q tests/test_vllm_native_tool_use_integration.py::test_vllm_models_use_native_tools_to_answer_simple_question -q
 ```
 
+## Decode throughput (max tokens/sec) benchmark
+
+To estimate **aggregate decode throughput** (tokens/sec) for a served model (e.g. GLM-4.7 on 8×H100), we include a small load generator:
+
+```bash
+cd agent
+uv run python scripts/benchmark_decode_tps.py \
+  --base-url http://127.0.0.1:30002/v1 \
+  --model zai-org/GLM-4.7-FP8 \
+  --max-tokens 1024 \
+  --duration-s 120 \
+  --concurrency 128 \
+  --timeout-s 3600
+```
+
+Notes:
+- This script **does not use tools**; it’s intended to saturate decode.
+- Increase `--concurrency` until the server is fully saturated (throughput stops increasing).
+
 ## ScholarQA-CSv2 run + GPT-4.1-mini judge
 
 This repo supports running ScholarQA-CSv2 from a local JSONL/JSON file and judging with GPT-4.1-mini.

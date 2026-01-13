@@ -308,6 +308,22 @@ def _get_preprocessed_dataset(
         **kwargs,
     )
 
+    # Optional: sort training samples by tokenized length to enable a simple curriculum.
+    # NOTE: This is only supported for map-style datasets (non-streaming).
+    if stage == "sft" and (not is_eval) and (not data_args.streaming) and getattr(data_args, "sort_by_token_length", False):
+        def _add_seq_len(example):
+            return {"_seq_len": len(example.get("input_ids", []))}
+
+        dataset = dataset.map(
+            _add_seq_len,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=(not data_args.overwrite_cache) or (training_args.local_process_index != 0),
+            desc="Computing token lengths for curriculum sorting",
+        )
+        dataset = dataset.sort("_seq_len")
+        # Important: don't leak the helper column into training batches.
+        dataset = dataset.remove_columns(["_seq_len"])
+
     if training_args.should_log:
         try:
             print("eval example:" if is_eval else "training example:")
