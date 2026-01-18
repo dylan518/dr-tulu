@@ -4,6 +4,7 @@ from typing import Dict, Optional
 import dotenv
 import requests
 from typing_extensions import TypedDict
+from urllib.parse import urlparse
 
 from ..cache import cached
 
@@ -27,6 +28,41 @@ class JinaWebpageResponse(TypedDict, total=False):
     metadata: JinaMetadata
     success: bool
     error: str
+
+
+def sanitize_web_url(url: str) -> str:
+    """
+    Normalize URLs before sending them to external fetchers.
+
+    - Strips whitespace
+    - Strips one or more leading 'view-source:' prefixes (common browser wrapper)
+    - Rejects non-http(s) schemes (data:, javascript:, file:, etc.)
+    """
+    if url is None:
+        raise ValueError("URL must be a non-empty http(s) URL; got None.")
+
+    u = str(url).strip()
+    if not u:
+        raise ValueError("URL must be a non-empty http(s) URL; got empty string.")
+
+    # Unwrap browser "view-source:" wrapper, potentially nested.
+    while u.lower().startswith("view-source:"):
+        u = u[len("view-source:") :].strip()
+
+    # Some callers may accidentally pass a fully qualified Jina Reader URL.
+    # We expect an http(s) URL here, so unwrap known prefixes.
+    if u.startswith("https://r.jina.ai/"):
+        u = u[len("https://r.jina.ai/") :].strip()
+    elif u.startswith("http://r.jina.ai/"):
+        u = u[len("http://r.jina.ai/") :].strip()
+
+    parsed = urlparse(u)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(
+            f"Invalid URL scheme '{parsed.scheme}'. Only http/https are allowed."
+        )
+
+    return u
 
 
 @cached()
@@ -54,6 +90,9 @@ def fetch_webpage_content_jina(
         - success: Boolean indicating if the fetch was successful
         - error: Error message if fetch failed
     """
+    # Validate/sanitize URL early so we fail fast without making HTTP requests.
+    url = sanitize_web_url(url)
+
     if not api_key:
         api_key = os.getenv("JINA_API_KEY")
         if not api_key:

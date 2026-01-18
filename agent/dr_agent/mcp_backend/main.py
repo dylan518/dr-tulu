@@ -27,7 +27,7 @@ from .apis.serper_apis import (
     search_serper,
     search_serper_scholar,
 )
-from .apis.jina_apis import JinaWebpageResponse, fetch_webpage_content_jina
+from .apis.jina_apis import JinaWebpageResponse, fetch_webpage_content_jina, sanitize_web_url
 from .cache import set_cache_enabled
 from .local.crawl4ai_fetcher import Crawl4AiResult
 
@@ -277,11 +277,28 @@ def serper_google_webpage_search(
         - peopleAlsoAsk: List of related questions
         - relatedSearches: List of related searches
     """
-    results = search_serper(
-        query=query, num_results=num_results, search_type="search", gl=gl, hl=hl
-    )
+    q = "" if query is None else str(query).strip()
+    if not q:
+        # Return a normal tool output (not an exception) so the agent can recover.
+        return {
+            "organic": [],
+            "success": False,
+            "error": "Missing required parameter: query (must be a non-empty string).",
+        }
 
-    return results
+    try:
+        results = search_serper(
+            query=q, num_results=num_results, search_type="search", gl=gl, hl=hl
+        )
+        # Preserve upstream schema, but add a small success marker.
+        results["success"] = True
+        return results
+    except Exception as e:
+        return {
+            "organic": [],
+            "success": False,
+            "error": str(e),
+        }
 
 
 @mcp.tool(tags={"browse", "necessary"})
@@ -346,8 +363,36 @@ def jina_fetch_webpage_content(
         - success: Boolean indicating if the fetch was successful
         - error: Error message if fetch failed
     """
-    result = fetch_webpage_content_jina(url=webpage_url, timeout=timeout)
-    return result
+    try:
+        clean_url = sanitize_web_url(webpage_url)
+    except Exception as e:
+        return {
+            "url": webpage_url,
+            "title": "",
+            "content": "",
+            "description": "",
+            "publishedTime": "",
+            "metadata": {},
+            "success": False,
+            "error": str(e),
+        }
+
+    try:
+        result = fetch_webpage_content_jina(url=clean_url, timeout=timeout)
+        # Ensure the response always includes "success" (some callers depend on it).
+        result["success"] = bool(result.get("success", True))
+        return result
+    except Exception as e:
+        return {
+            "url": clean_url,
+            "title": "",
+            "content": "",
+            "description": "",
+            "publishedTime": "",
+            "metadata": {},
+            "success": False,
+            "error": str(e),
+        }
 
 
 @mcp.tool(tags={"search", "necessary"})

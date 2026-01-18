@@ -167,9 +167,10 @@ class SearchAgent(BaseAgent):
 
     def postprocess_output(self, result: Dict[str, Any]) -> str:
         output_string = result.generated_text
-        if "</think>" in output_string:
-            output_string = "".join(output_string.split("</think>")[1:]).strip()
-
+        # IMPORTANT:
+        # Some models emit "<answer>...</answer>" and then continue with tool calls after "</think>".
+        # If we strip everything before "</think>" first, we can accidentally discard the real answer
+        # and return only the trailing "<call_tool ...>" string. Prefer extracting <answer> first.
         if "<answer>" in output_string:
             # Prefer returning the full <answer>...</answer> content for long-form tasks.
             # Only fall back to extracting a boxed short answer for short outputs.
@@ -180,6 +181,9 @@ class SearchAgent(BaseAgent):
             if "\\boxed{" in answer_content and len(answer_content) < 2000:
                 return answer_content.split("\\boxed{")[1].split("}")[0].strip()
             return answer_content
+
+        if "</think>" in output_string:
+            output_string = "".join(output_string.split("</think>")[1:]).strip()
 
         # Replace the "\boxed{" with "\\boxed{"
         output_string = output_string.replace("\boxed{", "\\boxed{")
@@ -250,9 +254,7 @@ class AnswerAgent(BaseAgent):
 
     def postprocess_output(self, result: Dict[str, Any]) -> str:
         output_string = result.generated_text
-        if "</think>" in output_string:
-            output_string = "".join(output_string.split("</think>")[1:]).strip()
-
+        # Same rationale as SearchAgent: extract <answer> before stripping </think>.
         if "<answer>" in output_string:
             # Prefer returning the full <answer>...</answer> content for long-form tasks.
             # Only fall back to extracting a boxed short answer for short outputs.
@@ -263,6 +265,9 @@ class AnswerAgent(BaseAgent):
             if "\\boxed{" in answer_content and len(answer_content) < 2000:
                 return answer_content.split("\\boxed{")[1].split("}")[0].strip()
             return answer_content
+
+        if "</think>" in output_string:
+            output_string = "".join(output_string.split("</think>")[1:]).strip()
 
         # Replace the "\boxed{" with "\\boxed{"
         output_string = output_string.replace("\boxed{", "\\boxed{")
@@ -755,8 +760,33 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         searched_links = list(set(searched_links))
 
         if "<answer>" in results.generated_text:
+            final_response = self.search_agent.postprocess_output(results)
+
+            # Guardrail: occasionally the model returns a tool call as the "final answer"
+            # (e.g., "<call_tool name='google_search'>...</call_tool>") even though we want prose.
+            # In that case, fall back to running the answer step once (no tools) with a stronger instruction.
+            if final_response.strip().startswith("<call_tool") or final_response.strip().startswith(
+                "<tool"
+            ):
+                answer_retry = await self.answer_agent(
+                    question=problem,
+                    history=results.generated_text,
+                    dataset_name=dataset_name,
+                    additional_instructions=(
+                        "DO NOT call tools. DO NOT output <call_tool> tags. "
+                        "Write the final answer now using the provided search results."
+                    ),
+                    generation_prefix="<answer>",
+                    max_tokens=cfg.search_agent_max_tokens,
+                    temperature=0.0,
+                    tool_calling_mode=cfg.search_agent_tool_calling_mode,
+                    verbose=verbose,
+                    on_step_callback=step_callback,
+                )
+                final_response = self.answer_agent.postprocess_output(answer_retry)
+
             return {
-                "final_response": self.search_agent.postprocess_output(results),
+                "final_response": final_response,
                 "full_traces": results,
                 "browsed_links": browsed_links,
                 "searched_links": searched_links,

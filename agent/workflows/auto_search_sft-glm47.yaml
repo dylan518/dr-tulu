@@ -1,4 +1,4 @@
-tool_parser: "v20250824"
+tool_parser: ${oc.env:DR_TOOL_PARSER,"v20250824"}
 
 # IMPORTANT: use Serper for search by default (does NOT require Semantic Scholar).
 # If you do not have a Semantic Scholar key, do NOT set search_tool_name to "s2"/"s2-only".
@@ -11,13 +11,20 @@ search_tool_name: ${oc.env:GLM47_SEARCH_TOOL,"serper"}
 # - Set GLM47_API_KEY if your server requires it (otherwise it can be any string)
 search_agent_base_url: ${oc.env:GLM47_BASE_URL,"http://127.0.0.1:30002/v1"}
 search_agent_model_name: ${oc.env:GLM47_MODEL_NAME,"zai-org/GLM-4.7-FP8"}
+# Token counting + chat template rendering:
+# Use the *served model's* tokenizer by default. Using an unrelated tokenizer can miscount tokens
+# and cause off-by-one (or worse) context-window failures under tight budgets.
+search_agent_tokenizer_name: ${oc.env:GLM47_TOKENIZER_NAME,"zai-org/GLM-4.7-FP8"}
 search_agent_api_key: ${oc.env:GLM47_API_KEY,"dummy-key"}
 # NOTE: this repo's generation loop treats max_tokens as a TOTAL token budget (prompt+completion),
 # so it must be large enough to fit the system prompt + question.
-# Keep it <= vLLM's --max-model-len (we use 4096 in the GLM launch command).
-search_agent_max_tokens: ${oc.env:GLM47_MAX_TOKENS,4096}
+# Keep it <= vLLM's --max-model-len (default is 16384 in ./scripts/serve_glm47_vllm.sh).
+search_agent_max_tokens: ${oc.env:GLM47_MAX_TOKENS,16384}
 search_agent_temperature: 1.0
-search_agent_max_tool_calls: ${oc.env:GLM47_MAX_TOOL_CALLS,6}
+# Tool-call budget:
+# - Set to a positive integer (e.g. 24) to cap tool use.
+# - Set to 0 (or any <=0 value) to disable the cap (bounded by max_tokens instead).
+search_agent_max_tool_calls: ${oc.env:GLM47_MAX_TOOL_CALLS,0}
 search_agent_tool_calling_mode: ${oc.env:GLM47_TOOL_CALLING_MODE,"native"}
 search_agent_force_first_tool: ${oc.env:GLM47_FORCE_FIRST_TOOL,"snippet_search"}
 
@@ -25,6 +32,7 @@ search_agent_force_first_tool: ${oc.env:GLM47_FORCE_FIRST_TOOL,"snippet_search"}
 use_browse_agent: false
 browse_agent_base_url: ${oc.env:GLM47_BROWSE_BASE_URL,"http://127.0.0.1:30002/v1"}
 browse_agent_model_name: ${oc.env:GLM47_BROWSE_MODEL_NAME,"glm-4.7"}
+browse_agent_tokenizer_name: ${oc.env:GLM47_BROWSE_TOKENIZER_NAME,"zai-org/GLM-4.7-FP8"}
 browse_agent_api_key: ${oc.env:GLM47_BROWSE_API_KEY,"dummy-key"}
 browse_agent_max_tokens: ${oc.env:GLM47_BROWSE_MAX_TOKENS,512}
 browse_agent_temperature: 0.3

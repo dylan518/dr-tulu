@@ -555,6 +555,16 @@ class LLMToolClient:
         """
 
         async with LLMToolClient._global_semaphore:
+            # Convention across this repo's YAML configs:
+            # - max_tool_calls <= 0 means "no explicit cap" (bounded by max_tokens instead).
+            # Some older client implementations treated 0 as "no tools allowed", which is not intended.
+            try:
+                max_tool_calls = int(max_tool_calls)
+            except Exception:
+                max_tool_calls = 10
+            if max_tool_calls <= 0:
+                max_tool_calls = 10**9
+
             # Route to native tool calling if requested
             # print(f"tool_calling_mode: {tool_calling_mode}")
             if tool_calling_mode == "native":
@@ -1062,18 +1072,19 @@ class LLMToolClient:
                 else:
                     on_step_callback("", realized_outputs)
 
-                if include_tool_results:
-                    for (tool, _call_info, _call_text), out in zip(
-                        (to_run + to_error), realized_outputs
-                    ):
-                        if out.called:
-                            result_formatted = tool.format_result(out)
-                            current_context += result_formatted
-                            if verbose:
-                                print(f"Tool '{tool.name}' output: {out.output[:200]}...")
+            # Always append tool results to context (unless disabled), regardless of callbacks.
+            if include_tool_results:
+                for (tool, _call_info, _call_text), out in zip(
+                    (to_run + to_error), realized_outputs
+                ):
+                    if out.called:
+                        result_formatted = tool.format_result(out)
+                        current_context += result_formatted
+                        if verbose:
+                            print(f"Tool '{tool.name}' output: {out.output[:200]}...")
 
-                if to_error:
-                    break
+            if to_error:
+                break
 
             # Check token limit again after adding tool results
             final_token_count = self._count_tokens(current_context)
@@ -1154,7 +1165,12 @@ class LLMToolClient:
         # If caller forces a tool_choice, only apply it on the FIRST iteration.
         # Forcing tool_choice on every iteration can cause infinite tool loops (e.g., vLLM will keep
         # returning tool_calls even after tool results are provided).
-        forced_tool_choice = kwargs.pop("tool_choice", "auto")
+        #
+        # IMPORTANT:
+        # Do NOT default to tool_choice="auto". For some OpenAI-compatible servers (notably vLLM),
+        # sending tool_choice="auto" requires extra server flags. Omitting tool_choice is equivalent
+        # to "auto" on OpenAI, and is more compatible with self-hosted endpoints.
+        forced_tool_choice = kwargs.pop("tool_choice", None)
 
         while True:
             iteration += 1
@@ -1190,7 +1206,7 @@ class LLMToolClient:
                 max_tokens=dynamic_max_tokens,
                 seed=seed,
                 verbose=verbose,
-                tool_choice=(forced_tool_choice if iteration == 1 else "auto"),
+                tool_choice=(forced_tool_choice if iteration == 1 else None),
                 **kwargs,
             )
 
@@ -1592,18 +1608,26 @@ class LLMToolClient:
         config = self.generation_config
 
         # Build parameters
-        tool_choice = kwargs.pop("tool_choice", "auto")
+        tool_choice = kwargs.pop("tool_choice", None)
         params = {
             "model": self.model_name,
             "messages": messages,
             "tools": tools,
-            "tool_choice": tool_choice,
             "temperature": (
                 temperature if temperature is not None else config.temperature
             ),
             "top_p": top_p if top_p is not None else config.top_p,
             "max_tokens": max_tokens if max_tokens is not None else config.max_tokens,
         }
+
+        # tool_choice handling:
+        # - For OpenAI, omitting tool_choice defaults to "auto"
+        # - For some OpenAI-compatible servers (notably vLLM), explicitly setting tool_choice="auto"
+        #   requires server flags (--enable-auto-tool-choice + --tool-call-parser). We avoid that footgun
+        #   by omitting tool_choice when it's "auto" and we're targeting a self-hosted base_url.
+        if tool_choice is not None:
+            if not (self.base_url and isinstance(tool_choice, str) and tool_choice == "auto"):
+                params["tool_choice"] = tool_choice
 
         # Add seed if provided
         if seed is not None or config.seed is not None:
@@ -1818,13 +1842,24 @@ class LLMToolClient:
 
         config = self.generation_config
 
-        # Use provided parameters or fall back to config defaults
-        params = {
-            "model": (
+        # Use provided parameters or fall back to config defaults.
+        #
+        # IMPORTANT:
+        # If `base_url` is set, we are targeting an OpenAI-compatible endpoint (e.g. vLLM).
+        # In that case, do NOT route through LiteLLM's "hosted_vllm/..." abstraction; it can
+        # ignore/override api_base depending on provider defaults and lead to requests being
+        # sent to the wrong backend (manifesting as bogus tiny context limits like 1512).
+        model_param = (
+            self.model_name
+            if self.base_url
+            else (
                 f"hosted_vllm/{self.model_name}"
                 if not self.model_name.startswith("hosted_vllm/")
                 else self.model_name
-            ),
+            )
+        )
+        params = {
+            "model": model_param,
             "prompt": prompt,
             "temperature": (
                 temperature if temperature is not None else config.temperature
@@ -1857,6 +1892,20 @@ class LLMToolClient:
             params["api_key"] = self.api_key
         if self.base_url:
             params["api_base"] = self.base_url
+            # Force LiteLLM to treat this as OpenAI-compatible and do not rewrite model names.
+            params["custom_llm_provider"] = "openai"
+
+        # IMPORTANT:
+        # This code path uses LiteLLM's *text completion* interface (atext_completion).
+        # Some callers (or shared agent code) may pass OpenAI Chat Completions tool params
+        # like `tool_choice` / `tools`. These are invalid for the completion endpoint and
+        # can crash inside provider SDKs (e.g., "unexpected keyword argument 'tool_choice'").
+        kwargs.pop("tool_choice", None)
+        kwargs.pop("tools", None)
+        # Legacy OpenAI tool/function calling params (also invalid here)
+        kwargs.pop("tool_calls", None)
+        kwargs.pop("functions", None)
+        kwargs.pop("function_call", None)
 
         # Add any additional kwargs
         params.update(kwargs)
@@ -1874,8 +1923,11 @@ class LLMToolClient:
                 f"Request timed out after {config.timeout} seconds"
             )
         except Exception as e:
-            print(f"API call failed: {e}")
-            raise Exception(f"API call failed: {e}")
+            api_base = params.get("api_base")
+            model = params.get("model")
+            # Keep the error text, but add enough routing context to debug misconfigurations fast.
+            print(f"API call failed (model={model!r}, api_base={api_base!r}): {e}")
+            raise Exception(f"API call failed (model={model!r}, api_base={api_base!r}): {e}")
 
     # Keep the old method name for backward compatibility, but delegate to vLLM implementation
     async def _generate_single_response(

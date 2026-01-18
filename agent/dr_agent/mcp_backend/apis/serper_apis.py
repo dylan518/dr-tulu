@@ -111,6 +111,11 @@ def search_serper(
         - peopleAlsoAsk: Optional list of related questions
         - relatedSearches: Optional list of related search queries
     """
+    # Validate query early so we fail fast (and testable) without making HTTP requests.
+    if query is None or not str(query).strip():
+        raise ValueError("Serper search 'query' must be a non-empty string.")
+    query = str(query).strip()
+
     if not api_key:
         import os
 
@@ -122,7 +127,9 @@ def search_serper(
 
     url = "https://google.serper.dev/search"
 
-    payload = json.dumps({"q": query, "num": num_results, "gl": gl, "hl": hl, "type": search_type})
+    payload = json.dumps(
+        {"q": query, "num": num_results, "gl": gl, "hl": hl, "type": search_type}
+    )
 
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
 
@@ -164,6 +171,11 @@ def search_serper_scholar(
             - year: Publication year
             - citedBy: Number of citations
     """
+    # Validate query early so we fail fast (and testable) without making HTTP requests.
+    if query is None or not str(query).strip():
+        raise ValueError("Serper scholar search 'query' must be a non-empty string.")
+    query = str(query).strip()
+
     if not api_key:
         import os
 

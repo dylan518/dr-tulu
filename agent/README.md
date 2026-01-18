@@ -81,6 +81,9 @@ cd agent
 ```
 
 This launches an OpenAI-compatible server on `http://127.0.0.1:30002/v1` by default.
+Defaults:
+- `MAX_MODEL_LEN=16384` (override via env var when launching `serve_glm47_vllm.sh`)
+- In `workflows/auto_search_sft-glm47.yaml`, `search_agent_max_tokens` should be **<=** `MAX_MODEL_LEN`.
 
 ### 3) Run the key integration tests
 
@@ -117,6 +120,23 @@ uv run python scripts/benchmark_decode_tps.py \
 Notes:
 - This script **does not use tools**; it’s intended to saturate decode.
 - Increase `--concurrency` until the server is fully saturated (throughput stops increasing).
+
+### Example result (GLM-4.7-FP8 @ concurrency=256)
+
+Most recent run (duration mode, `--max-tokens 1024`, `--concurrency 256`) produced:
+
+- **aggregate_decode_tps**: **~537 tokens/sec**
+- **errors**: **0**
+
+Important interpretation details:
+
+- In `--duration-s` mode, workers only check the stop condition **between requests**. If requests are long, the **measured `wall_time_s` may exceed `duration-s`** (this is expected).
+- For throughput comparisons, use the script’s printed **`aggregate_decode_tps`** and **`wall_time_s`** (not the requested `duration-s`).
+
+### Practical “optimal TPS” procedure (fast)
+
+- Start at a high concurrency (e.g. **256**) and increase (512, 768, …) until **aggregate_decode_tps plateaus** and error/timeout rate remains acceptable.
+- If TPS plateaus lower than expected, consider vLLM serving knobs (KV cache headroom / batching limits / queue depth). See `./scripts/serve_glm47_vllm.sh` for the defaults used here.
 
 ## ScholarQA-CSv2 run + GPT-4.1-mini judge
 
